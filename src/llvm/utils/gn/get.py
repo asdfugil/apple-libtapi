@@ -1,17 +1,10 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Downloads a prebuilt gn binary to a place where gn.py can find it."""
-
-from __future__ import print_function
 
 import io
 import os
-try:
-    # In Python 3, we need the module urllib.reqest. In Python 2, this
-    # functionality was in the urllib2 module.
-    from urllib import request as urllib_request
-except ImportError:
-    import urllib2 as urllib_request
 import sys
+import urllib.request
 import zipfile
 
 
@@ -19,7 +12,7 @@ def download_and_unpack(url, output_dir, gn):
     """Download an archive from url and extract gn from it into output_dir."""
     print('downloading %s ...' % url, end='')
     sys.stdout.flush()
-    data = urllib_request.urlopen(url).read()
+    data = urllib.request.urlopen(url).read()
     print(' done')
     zipfile.ZipFile(io.BytesIO(data)).extract(gn, path=output_dir)
 
@@ -46,6 +39,11 @@ def main():
     platform = get_platform()
     if not platform:
         print('no prebuilt binary for', sys.platform)
+        print('build it yourself with:')
+        print('  rm -rf /tmp/gn &&')
+        print('  pushd /tmp && git clone https://gn.googlesource.com/gn &&')
+        print('  cd gn && build/gen.py && ninja -C out gn && popd &&')
+        print('  cp /tmp/gn/out/gn somewhere/on/PATH')
         return 1
     dirname = os.path.join(os.path.dirname(__file__), 'bin', platform)
     if not os.path.exists(dirname):

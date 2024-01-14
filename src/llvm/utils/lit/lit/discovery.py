@@ -7,7 +7,7 @@ import os
 import sys
 
 from lit.TestingConfig import TestingConfig
-from lit import LitConfig, Test
+from lit import LitConfig, Test, util
 
 def chooseConfigFileFromDir(dir, config_names):
     for name in config_names:
@@ -52,9 +52,8 @@ def getTestSuite(item, litConfig, cache):
         # configuration to load instead.
         config_map = litConfig.params.get('config_map')
         if config_map:
-            cfgpath = os.path.realpath(cfgpath)
-            cfgpath = os.path.normcase(cfgpath)
-            target = config_map.get(cfgpath)
+            cfgpath = util.abs_path_preserve_drive(cfgpath)
+            target = config_map.get(os.path.normcase(cfgpath))
             if target:
                 cfgpath = target
 
@@ -64,13 +63,13 @@ def getTestSuite(item, litConfig, cache):
 
         cfg = TestingConfig.fromdefaults(litConfig)
         cfg.load_from_path(cfgpath, litConfig)
-        source_root = os.path.realpath(cfg.test_source_root or path)
-        exec_root = os.path.realpath(cfg.test_exec_root or path)
+        source_root = util.abs_path_preserve_drive(cfg.test_source_root or path)
+        exec_root = util.abs_path_preserve_drive(cfg.test_exec_root or path)
         return Test.TestSuite(cfg.name, source_root, exec_root, cfg), ()
 
     def search(path):
         # Check for an already instantiated test suite.
-        real_path = os.path.realpath(path)
+        real_path = util.abs_path_preserve_drive(path)
         res = cache.get(real_path)
         if res is None:
             cache[real_path] = res = search1(path)
@@ -160,8 +159,13 @@ def getTestsInSuite(ts, path_in_suite, litConfig,
         # tests which are not executed. The check adds some performance
         # overhead which might be important if a large number of tests
         # are being run directly.
-        # --no-indirectly-run-check: skips this check.
-        if indirectlyRunCheck and lc.test_format is not None:
+        # This check can be disabled by using --no-indirectly-run-check or
+        # setting the standalone_tests variable in the suite's configuration.
+        if (
+            indirectlyRunCheck
+            and lc.test_format is not None
+            and not lc.standalone_tests
+        ):
             found = False
             for res in lc.test_format.getTestsInDirectory(ts, test_dir_in_suite,
                                                           litConfig, lc):
@@ -171,6 +175,7 @@ def getTestsInSuite(ts, path_in_suite, litConfig,
             if not found:
                 litConfig.error(
                     '%r would not be run indirectly: change name or LIT config'
+                    '(e.g. suffixes or standalone_tests variables)'
                     % test.getFullName())
 
         yield test
@@ -179,6 +184,15 @@ def getTestsInSuite(ts, path_in_suite, litConfig,
     # Otherwise we have a directory to search for tests, start by getting the
     # local configuration.
     lc = getLocalConfig(ts, path_in_suite, litConfig, localConfigCache)
+
+    # Directory contains tests to be run standalone. Do not try to discover.
+    if lc.standalone_tests:
+        if lc.suffixes or lc.excludes:
+            litConfig.warning(
+                'standalone_tests set in LIT config but suffixes or excludes'
+                    ' are also set'
+            )
+        return
 
     # Search for tests.
     if lc.test_format is not None:
@@ -269,7 +283,8 @@ def find_tests_for_inputs(lit_config, inputs, indirectlyRunCheck):
     # This data is no longer needed but keeping it around causes awful
     # performance problems while the test suites run.
     for k, suite in test_suite_cache.items():
-      suite[0].test_times = None
+      if suite[0]:
+        suite[0].test_times = None
 
     # If there were any errors during test discovery, exit now.
     if lit_config.numErrors:

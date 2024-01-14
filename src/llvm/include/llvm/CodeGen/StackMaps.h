@@ -13,7 +13,6 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/IR/CallingConv.h"
-#include "llvm/MC/MCSymbol.h"
 #include "llvm/Support/Debug.h"
 #include <algorithm>
 #include <cassert>
@@ -23,6 +22,7 @@
 namespace llvm {
 
 class AsmPrinter;
+class MCSymbol;
 class MCExpr;
 class MCStreamer;
 class raw_ostream;
@@ -224,6 +224,15 @@ public:
   uint64_t getNumDeoptArgs() const {
     return MI->getOperand(getNumDeoptArgsIdx()).getImm();
   }
+
+  /// Get index of number of gc map entries.
+  unsigned getNumGcMapEntriesIdx();
+
+  /// Get index of number of gc allocas.
+  unsigned getNumAllocaIdx();
+
+  /// Get index of number of GC pointers.
+  unsigned getNumGCPtrIdx();
 
   /// Get index of first GC pointer operand of -1 if there are none.
   int getFirstGCPtrIdx();

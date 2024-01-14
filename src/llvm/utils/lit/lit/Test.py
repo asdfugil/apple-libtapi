@@ -3,6 +3,7 @@ import os
 from json import JSONEncoder
 
 from lit.BooleanExpression import BooleanExpression
+from lit.TestTimes import read_test_times
 
 # Test result codes.
 
@@ -207,15 +208,7 @@ class TestSuite:
         # The test suite configuration.
         self.config = config
 
-        self.test_times = {}
-        test_times_file = os.path.join(exec_root, '.lit_test_times.txt')
-        if not os.path.exists(test_times_file):
-            test_times_file = os.path.join(source_root, '.lit_test_times.txt')
-        if os.path.exists(test_times_file):
-            with open(test_times_file, 'r') as time_file:
-                for line in time_file:
-                    time, path = line.split(maxsplit=1)
-                    self.test_times[path.strip('\n')] = float(time)
+        self.test_times = read_test_times(self)
 
     def getSourcePath(self, components):
         return os.path.join(self.source_root, *components)
@@ -226,17 +219,21 @@ class TestSuite:
 class Test:
     """Test - Information on a single test instance."""
 
-    def __init__(self, suite, path_in_suite, config, file_path = None):
+    def __init__(self, suite, path_in_suite, config, file_path = None, gtest_json_file = None):
         self.suite = suite
         self.path_in_suite = path_in_suite
         self.config = config
         self.file_path = file_path
+        self.gtest_json_file = gtest_json_file
 
         # A list of conditions under which this test is expected to fail.
         # Each condition is a boolean expression of features and target
         # triple parts. These can optionally be provided by test format
         # handlers, and will be honored when the test result is supplied.
         self.xfails = []
+
+        # If true, ignore all items in self.xfails.
+        self.xfail_not = False
 
         # A list of conditions that must be satisfied before running the test.
         # Each condition is a boolean expression of features. All of them
@@ -262,7 +259,7 @@ class Test:
         # The previous test elapsed time, if applicable.
         self.previous_elapsed = 0.0
 
-        if '/'.join(path_in_suite) in suite.test_times:
+        if suite.test_times and '/'.join(path_in_suite) in suite.test_times:
             time = suite.test_times['/'.join(path_in_suite)]
             self.previous_elapsed = abs(time)
             self.previous_failure = time < 0
@@ -315,6 +312,9 @@ class Test:
         executed.
         Throws ValueError if an XFAIL line has a syntax error.
         """
+
+        if self.xfail_not:
+          return False
 
         features = self.config.available_features
         triple = getattr(self.suite.config, 'target_triple', "")
@@ -415,5 +415,5 @@ class Test:
             BooleanExpression.tokenize(expr) for expr in
                 boolean_expressions if expr != '*'
         )
-        identifiers = set(filter(BooleanExpression.isIdentifier, tokens))
-        return identifiers
+        matchExpressions = set(filter(BooleanExpression.isMatchExpression, tokens))
+        return matchExpressions

@@ -14,17 +14,16 @@
 #include "llvm-c/DebugInfo.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/None.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DIBuilder.h"
+#include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DebugLoc.h"
-#include "llvm/IR/DebugInfo.h"
-#include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GVMaterializer.h"
 #include "llvm/IR/Instruction.h"
@@ -39,6 +38,92 @@
 
 using namespace llvm;
 using namespace llvm::dwarf;
+
+/// Finds all intrinsics declaring local variables as living in the memory that
+/// 'V' points to. This may include a mix of dbg.declare and
+/// dbg.addr intrinsics.
+TinyPtrVector<DbgVariableIntrinsic *> llvm::FindDbgAddrUses(Value *V) {
+  // This function is hot. Check whether the value has any metadata to avoid a
+  // DenseMap lookup.
+  if (!V->isUsedByMetadata())
+    return {};
+  auto *L = LocalAsMetadata::getIfExists(V);
+  if (!L)
+    return {};
+  auto *MDV = MetadataAsValue::getIfExists(V->getContext(), L);
+  if (!MDV)
+    return {};
+
+  TinyPtrVector<DbgVariableIntrinsic *> Declares;
+  for (User *U : MDV->users()) {
+    if (auto *DII = dyn_cast<DbgVariableIntrinsic>(U))
+      if (DII->isAddressOfVariable())
+        Declares.push_back(DII);
+  }
+
+  return Declares;
+}
+
+TinyPtrVector<DbgDeclareInst *> llvm::FindDbgDeclareUses(Value *V) {
+  TinyPtrVector<DbgDeclareInst *> DDIs;
+  for (DbgVariableIntrinsic *DVI : FindDbgAddrUses(V))
+    if (auto *DDI = dyn_cast<DbgDeclareInst>(DVI))
+      DDIs.push_back(DDI);
+  return DDIs;
+}
+
+void llvm::findDbgValues(SmallVectorImpl<DbgValueInst *> &DbgValues, Value *V) {
+  // This function is hot. Check whether the value has any metadata to avoid a
+  // DenseMap lookup.
+  if (!V->isUsedByMetadata())
+    return;
+  // TODO: If this value appears multiple times in a DIArgList, we should still
+  // only add the owning DbgValueInst once; use this set to track ArgListUsers.
+  // This behaviour can be removed when we can automatically remove duplicates.
+  SmallPtrSet<DbgValueInst *, 4> EncounteredDbgValues;
+  if (auto *L = LocalAsMetadata::getIfExists(V)) {
+    if (auto *MDV = MetadataAsValue::getIfExists(V->getContext(), L)) {
+      for (User *U : MDV->users())
+        if (DbgValueInst *DVI = dyn_cast<DbgValueInst>(U))
+          DbgValues.push_back(DVI);
+    }
+    for (Metadata *AL : L->getAllArgListUsers()) {
+      if (auto *MDV = MetadataAsValue::getIfExists(V->getContext(), AL)) {
+        for (User *U : MDV->users())
+          if (DbgValueInst *DVI = dyn_cast<DbgValueInst>(U))
+            if (EncounteredDbgValues.insert(DVI).second)
+              DbgValues.push_back(DVI);
+      }
+    }
+  }
+}
+
+void llvm::findDbgUsers(SmallVectorImpl<DbgVariableIntrinsic *> &DbgUsers,
+                        Value *V) {
+  // This function is hot. Check whether the value has any metadata to avoid a
+  // DenseMap lookup.
+  if (!V->isUsedByMetadata())
+    return;
+  // TODO: If this value appears multiple times in a DIArgList, we should still
+  // only add the owning DbgValueInst once; use this set to track ArgListUsers.
+  // This behaviour can be removed when we can automatically remove duplicates.
+  SmallPtrSet<DbgVariableIntrinsic *, 4> EncounteredDbgValues;
+  if (auto *L = LocalAsMetadata::getIfExists(V)) {
+    if (auto *MDV = MetadataAsValue::getIfExists(V->getContext(), L)) {
+      for (User *U : MDV->users())
+        if (DbgVariableIntrinsic *DII = dyn_cast<DbgVariableIntrinsic>(U))
+          DbgUsers.push_back(DII);
+    }
+    for (Metadata *AL : L->getAllArgListUsers()) {
+      if (auto *MDV = MetadataAsValue::getIfExists(V->getContext(), AL)) {
+        for (User *U : MDV->users())
+          if (DbgVariableIntrinsic *DII = dyn_cast<DbgVariableIntrinsic>(U))
+            if (EncounteredDbgValues.insert(DII).second)
+              DbgUsers.push_back(DII);
+      }
+    }
+  }
+}
 
 DISubprogram *llvm::getDISubprogram(const MDNode *Scope) {
   if (auto *LocalScope = dyn_cast_or_null<DILocalScope>(Scope))
@@ -76,7 +161,7 @@ void DebugInfoFinder::processModule(const Module &M) {
 void DebugInfoFinder::processCompileUnit(DICompileUnit *CU) {
   if (!addCompileUnit(CU))
     return;
-  for (auto DIG : CU->getGlobalVariables()) {
+  for (auto *DIG : CU->getGlobalVariables()) {
     if (!addGlobalVariable(DIG))
       continue;
     auto *GV = DIG->getVariable();
@@ -302,7 +387,7 @@ static bool isDILocationReachable(SmallPtrSetImpl<Metadata *> &Visited,
   MDNode *N = dyn_cast_or_null<MDNode>(MD);
   if (!N)
     return false;
-  if (Reachable.count(N) || isa<DILocation>(N))
+  if (isa<DILocation>(N) || Reachable.count(N))
     return true;
   if (!Visited.insert(N).second)
     return false;
@@ -329,21 +414,18 @@ static MDNode *stripDebugLocFromLoopID(MDNode *N) {
   // count_if avoids an early exit.
   if (!std::count_if(N->op_begin() + 1, N->op_end(),
                      [&Visited, &DILocationReachable](const MDOperand &Op) {
-                       return isa<DILocation>(Op.get()) ||
-                              isDILocationReachable(
+                       return isDILocationReachable(
                                   Visited, DILocationReachable, Op.get());
                      }))
     return N;
 
   // If there is only the debug location without any actual loop metadata, we
   // can remove the metadata.
-  if (std::all_of(
-          N->op_begin() + 1, N->op_end(),
-          [&Visited, &DILocationReachable](const MDOperand &Op) {
-            return isa<DILocation>(Op.get()) ||
-                   isDILocationReachable(Visited, DILocationReachable,
-                                         Op.get());
-          }))
+  if (llvm::all_of(llvm::drop_begin(N->operands()),
+                   [&Visited, &DILocationReachable](const MDOperand &Op) {
+                     return isDILocationReachable(Visited, DILocationReachable,
+                                                  Op.get());
+                   }))
     return nullptr;
 
   return updateLoopMetadataDebugLocationsImpl(
@@ -363,8 +445,7 @@ bool llvm::stripDebugInfo(Function &F) {
 
   DenseMap<MDNode *, MDNode *> LoopIDsMap;
   for (BasicBlock &BB : F) {
-    for (auto II = BB.begin(), End = BB.end(); II != End;) {
-      Instruction &I = *II++; // We may delete the instruction, increment now.
+    for (Instruction &I : llvm::make_early_inc_range(BB)) {
       if (isa<DbgInfoIntrinsic>(&I)) {
         I.eraseFromParent();
         Changed = true;
@@ -392,16 +473,12 @@ bool llvm::stripDebugInfo(Function &F) {
 bool llvm::StripDebugInfo(Module &M) {
   bool Changed = false;
 
-  for (Module::named_metadata_iterator NMI = M.named_metadata_begin(),
-         NME = M.named_metadata_end(); NMI != NME;) {
-    NamedMDNode *NMD = &*NMI;
-    ++NMI;
-
+  for (NamedMDNode &NMD : llvm::make_early_inc_range(M.named_metadata())) {
     // We're stripping debug info, and without them, coverage information
     // doesn't quite make sense.
-    if (NMD->getName().startswith("llvm.dbg.") ||
-        NMD->getName() == "llvm.gcov") {
-      NMD->eraseFromParent();
+    if (NMD.getName().startswith("llvm.dbg.") ||
+        NMD.getName() == "llvm.gcov") {
+      NMD.eraseFromParent();
       Changed = true;
     }
   }
@@ -746,7 +823,14 @@ void Instruction::dropLocation() {
 
   // If this isn't a call, drop the location to allow a location from a
   // preceding instruction to propagate.
-  if (!isa<CallBase>(this)) {
+  bool MayLowerToCall = false;
+  if (isa<CallBase>(this)) {
+    auto *II = dyn_cast<IntrinsicInst>(this);
+    MayLowerToCall =
+        !II || IntrinsicInst::mayLowerToFunctionCall(II->getIntrinsicID());
+  }
+
+  if (!MayLowerToCall) {
     setDebugLoc(DebugLoc());
     return;
   }
@@ -827,6 +911,11 @@ void LLVMDisposeDIBuilder(LLVMDIBuilderRef Builder) {
 
 void LLVMDIBuilderFinalize(LLVMDIBuilderRef Builder) {
   unwrap(Builder)->finalize();
+}
+
+void LLVMDIBuilderFinalizeSubprogram(LLVMDIBuilderRef Builder,
+                                     LLVMMetadataRef subprogram) {
+  unwrap(Builder)->finalizeSubprogram(unwrapDI<DISubprogram>(subprogram));
 }
 
 LLVMMetadataRef LLVMDIBuilderCreateCompileUnit(
@@ -923,41 +1012,43 @@ LLVMDIBuilderCreateImportedModuleFromNamespace(LLVMDIBuilderRef Builder,
                                                     Line));
 }
 
-LLVMMetadataRef
-LLVMDIBuilderCreateImportedModuleFromAlias(LLVMDIBuilderRef Builder,
-                                           LLVMMetadataRef Scope,
-                                           LLVMMetadataRef ImportedEntity,
-                                           LLVMMetadataRef File,
-                                           unsigned Line) {
+LLVMMetadataRef LLVMDIBuilderCreateImportedModuleFromAlias(
+    LLVMDIBuilderRef Builder, LLVMMetadataRef Scope,
+    LLVMMetadataRef ImportedEntity, LLVMMetadataRef File, unsigned Line,
+    LLVMMetadataRef *Elements, unsigned NumElements) {
+  auto Elts =
+      (NumElements > 0)
+          ? unwrap(Builder)->getOrCreateArray({unwrap(Elements), NumElements})
+          : nullptr;
   return wrap(unwrap(Builder)->createImportedModule(
-                  unwrapDI<DIScope>(Scope),
-                  unwrapDI<DIImportedEntity>(ImportedEntity),
-                  unwrapDI<DIFile>(File), Line));
+      unwrapDI<DIScope>(Scope), unwrapDI<DIImportedEntity>(ImportedEntity),
+      unwrapDI<DIFile>(File), Line, Elts));
 }
 
-LLVMMetadataRef
-LLVMDIBuilderCreateImportedModuleFromModule(LLVMDIBuilderRef Builder,
-                                            LLVMMetadataRef Scope,
-                                            LLVMMetadataRef M,
-                                            LLVMMetadataRef File,
-                                            unsigned Line) {
-  return wrap(unwrap(Builder)->createImportedModule(unwrapDI<DIScope>(Scope),
-                                                    unwrapDI<DIModule>(M),
-                                                    unwrapDI<DIFile>(File),
-                                                    Line));
+LLVMMetadataRef LLVMDIBuilderCreateImportedModuleFromModule(
+    LLVMDIBuilderRef Builder, LLVMMetadataRef Scope, LLVMMetadataRef M,
+    LLVMMetadataRef File, unsigned Line, LLVMMetadataRef *Elements,
+    unsigned NumElements) {
+  auto Elts =
+      (NumElements > 0)
+          ? unwrap(Builder)->getOrCreateArray({unwrap(Elements), NumElements})
+          : nullptr;
+  return wrap(unwrap(Builder)->createImportedModule(
+      unwrapDI<DIScope>(Scope), unwrapDI<DIModule>(M), unwrapDI<DIFile>(File),
+      Line, Elts));
 }
 
-LLVMMetadataRef
-LLVMDIBuilderCreateImportedDeclaration(LLVMDIBuilderRef Builder,
-                                       LLVMMetadataRef Scope,
-                                       LLVMMetadataRef Decl,
-                                       LLVMMetadataRef File,
-                                       unsigned Line,
-                                       const char *Name, size_t NameLen) {
+LLVMMetadataRef LLVMDIBuilderCreateImportedDeclaration(
+    LLVMDIBuilderRef Builder, LLVMMetadataRef Scope, LLVMMetadataRef Decl,
+    LLVMMetadataRef File, unsigned Line, const char *Name, size_t NameLen,
+    LLVMMetadataRef *Elements, unsigned NumElements) {
+  auto Elts =
+      (NumElements > 0)
+          ? unwrap(Builder)->getOrCreateArray({unwrap(Elements), NumElements})
+          : nullptr;
   return wrap(unwrap(Builder)->createImportedDeclaration(
-                  unwrapDI<DIScope>(Scope),
-                  unwrapDI<DINode>(Decl),
-                  unwrapDI<DIFile>(File), Line, {Name, NameLen}));
+      unwrapDI<DIScope>(Scope), unwrapDI<DINode>(Decl), unwrapDI<DIFile>(File),
+      Line, {Name, NameLen}, Elts));
 }
 
 LLVMMetadataRef
@@ -1350,14 +1441,14 @@ LLVMDIBuilderCreateSubroutineType(LLVMDIBuilderRef Builder,
 }
 
 LLVMMetadataRef LLVMDIBuilderCreateExpression(LLVMDIBuilderRef Builder,
-                                              int64_t *Addr, size_t Length) {
-  return wrap(unwrap(Builder)->createExpression(ArrayRef<int64_t>(Addr,
-                                                                  Length)));
+                                              uint64_t *Addr, size_t Length) {
+  return wrap(
+      unwrap(Builder)->createExpression(ArrayRef<uint64_t>(Addr, Length)));
 }
 
 LLVMMetadataRef
 LLVMDIBuilderCreateConstantValueExpression(LLVMDIBuilderRef Builder,
-                                           int64_t Value) {
+                                           uint64_t Value) {
   return wrap(unwrap(Builder)->createConstantValueExpression(Value));
 }
 

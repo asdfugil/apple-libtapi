@@ -3,6 +3,7 @@ set(LLVM_LINK_COMPONENTS
   )
 
 add_llvm_unittest(SupportTests
+  AddressRangeTest.cpp
   AlignmentTest.cpp
   AlignOfTest.cpp
   AllocatorTest.cpp
@@ -11,6 +12,7 @@ add_llvm_unittest(SupportTests
   ArrayRecyclerTest.cpp
   Base64Test.cpp
   BinaryStreamTest.cpp
+  BLAKE3Test.cpp
   BlockFrequencyTest.cpp
   BranchProbabilityTest.cpp
   CachePruningTest.cpp
@@ -22,6 +24,8 @@ add_llvm_unittest(SupportTests
   CompressionTest.cpp
   ConvertUTFTest.cpp
   CRCTest.cpp
+  CSKYAttributeParserTest.cpp
+  CSKYTargetParserTest.cpp
   DataExtractorTest.cpp
   DebugTest.cpp
   DebugCounterTest.cpp
@@ -36,9 +40,11 @@ add_llvm_unittest(SupportTests
   FileCollectorTest.cpp
   FileOutputBufferTest.cpp
   FileUtilitiesTest.cpp
+  FormatChkTest.cpp
   FormatVariadicTest.cpp
   FSUniqueIDTest.cpp
   GlobPatternTest.cpp
+  HashBuilderTest.cpp
   Host.cpp
   IndexedAccessorTest.cpp
   InstructionCostTest.cpp
@@ -60,6 +66,7 @@ add_llvm_unittest(SupportTests
   OptimizedStructLayoutTest.cpp
   ParallelTest.cpp
   Path.cpp
+  PrefixMapperTest.cpp
   ProcessTest.cpp
   ProgramTest.cpp
   RegexTest.cpp
@@ -67,6 +74,8 @@ add_llvm_unittest(SupportTests
   ReplaceFileTest.cpp
   RISCVAttributeParserTest.cpp
   ScaledNumberTest.cpp
+  ScopedPrinterTest.cpp
+  SHA256.cpp
   SourceMgrTest.cpp
   SpecialCaseListTest.cpp
   SuffixTreeTest.cpp
@@ -79,6 +88,7 @@ add_llvm_unittest(SupportTests
   ThreadPool.cpp
   Threading.cpp
   TimerTest.cpp
+  TimeProfilerTest.cpp
   ToolOutputFileTest.cpp
   TypeNameTest.cpp
   TypeTraitsTest.cpp
@@ -87,12 +97,18 @@ add_llvm_unittest(SupportTests
   UnicodeTest.cpp
   VersionTupleTest.cpp
   VirtualFileSystemTest.cpp
+  VirtualOutputBackendTest.cpp
+  VirtualOutputBackendsTest.cpp
+  VirtualOutputConfigTest.cpp
+  VirtualOutputFileTest.cpp
   WithColorTest.cpp
   YAMLIOTest.cpp
   YAMLParserTest.cpp
+  buffer_ostream_test.cpp
   formatted_raw_ostream_test.cpp
   raw_fd_stream_test.cpp
   raw_ostream_test.cpp
+  raw_ostream_proxy_test.cpp
   raw_pwrite_stream_test.cpp
   raw_sha1_ostream_test.cpp
   xxhashTest.cpp
@@ -126,3 +142,5 @@ if(NOT LLVM_INTEGRATED_CRT_ALLOC)
   # The test doesn't pass when using a custom allocator, PR47881.
   add_subdirectory(DynamicLibrary)
 endif()
+
+add_subdirectory(CommandLineInit)

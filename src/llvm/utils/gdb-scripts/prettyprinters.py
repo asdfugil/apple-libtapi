@@ -16,9 +16,6 @@ class Iterator:
   def children(self):
     return self
 
-def escape_bytes(val, l):
-  return '"' + val.string(encoding='Latin-1', length=l).encode('unicode_escape').decode() + '"'
-
 class SmallStringPrinter:
   """Print an llvm::SmallString object."""
 
@@ -26,8 +23,12 @@ class SmallStringPrinter:
     self.val = val
 
   def to_string(self):
-    begin = self.val['BeginX']
-    return escape_bytes(begin.cast(gdb.lookup_type('char').pointer()), self.val['Size'])
+    data = self.val['BeginX'].cast(gdb.lookup_type('char').pointer())
+    length = self.val['Size']
+    return data.lazy_string(length=length)
+
+  def display_hint (self):
+    return 'string'
 
 class StringRefPrinter:
   """Print an llvm::StringRef object."""
@@ -36,7 +37,12 @@ class StringRefPrinter:
     self.val = val
 
   def to_string(self):
-    return escape_bytes(self.val['Data'], self.val['Length'])
+    data = self.val['Data']
+    length = self.val['Length']
+    return data.lazy_string(length=length)
+
+  def display_hint(self):
+    return 'string'
 
 class SmallVectorPrinter(Iterator):
   """Print an llvm::SmallVector object."""
@@ -131,7 +137,7 @@ class OptionalPrinter(Iterator):
     self.val = None
     if not val['Storage']['hasVal']:
       raise StopIteration
-    return ('value', val['Storage']['value'])
+    return ('value', val['Storage']['val'])
 
   def to_string(self):
     return 'llvm::Optional{}'.format('' if self.val['Storage']['hasVal'] else ' is not initialized')
@@ -211,7 +217,7 @@ class StringMapPrinter:
     it = self.val['TheTable']
     end = (it + self.val['NumBuckets'])
     value_ty = self.val.type.template_argument(0)
-    entry_ty = gdb.lookup_type('llvm::StringMapEntry<{}>'.format(value_ty.name))
+    entry_base_ty = gdb.lookup_type('llvm::StringMapEntryBase')
     tombstone = gdb.parse_and_eval('llvm::StringMapImpl::TombstoneIntVal');
 
     while it != end:
@@ -220,15 +226,17 @@ class StringMapPrinter:
         it = it + 1
         continue
 
-      entry_ptr = it_deref.cast(entry_ty.pointer())
+      entry_ptr = it_deref.cast(entry_base_ty.pointer())
       entry = entry_ptr.dereference()
 
       str_len = entry['keyLength']
-      str_data = (entry_ptr + 1).cast(gdb.lookup_type('char').const().pointer())
+      value_ptr = (entry_ptr + 1).cast(value_ty.pointer())
+      str_data = (entry_ptr + 1).cast(gdb.lookup_type('uintptr_t')) + max(value_ty.sizeof, entry_base_ty.alignof)
+      str_data = str_data.cast(gdb.lookup_type('char').const().pointer())
       string_ref = gdb.Value(struct.pack('PN', int(str_data), int(str_len)), gdb.lookup_type('llvm::StringRef'))
       yield 'key', string_ref
 
-      value = entry['second']
+      value = value_ptr.dereference()
       yield 'value', value
 
       it = it + 1
@@ -263,7 +271,7 @@ class TwinePrinter:
       # register the LazyString type, so we can't check
       # "type(s) == gdb.LazyString".
       if 'LazyString' in type(s).__name__:
-        s = s.value().address.string()
+        s = s.value().string()
 
     else:
       print(('No pretty printer for {} found. The resulting Twine ' +
@@ -296,15 +304,11 @@ class TwinePrinter:
       val = child['stdString'].dereference()
       return self.string_from_pretty_printer_lookup(val)
 
-    if self.is_twine_kind(kind, 'StringRefKind'):
-      val = child['stringRef'].dereference()
-      pp = StringRefPrinter(val)
-      return pp.to_string()
-
-    if self.is_twine_kind(kind, 'SmallStringKind'):
-      val = child['smallString'].dereference()
-      pp = SmallStringPrinter(val)
-      return pp.to_string()
+    if self.is_twine_kind(kind, 'PtrAndLengthKind'):
+      val = child['ptrAndLength']
+      data = val['ptr']
+      length = val['length']
+      return data.string(length=length)
 
     if self.is_twine_kind(kind, 'CharKind'):
       return chr(child['character'])
@@ -339,11 +343,9 @@ class TwinePrinter:
   def string_from_twine_object(self, twine):
     '''Return the string representation of the Twine object twine.'''
 
-    lhs_str = ''
-    rhs_str = ''
-
     lhs = twine['LHS']
     rhs = twine['RHS']
+
     lhs_kind = str(twine['LHSKind'])
     rhs_kind = str(twine['RHSKind'])
 
@@ -354,6 +356,9 @@ class TwinePrinter:
 
   def to_string(self):
     return self.string_from_twine_object(self._val)
+
+  def display_hint(self):
+    return 'string'
 
 def get_pointer_int_pair(val):
   """Get tuple from llvm::PointerIntPair."""
@@ -380,6 +385,9 @@ class PointerIntPairPrinter:
   def children(self):
     yield ('pointer', self.pointer)
     yield ('value', self.value)
+
+  def to_string(self):
+    return '(%s, %s)' % (self.pointer.type, self.value.type)
 
 def make_pointer_int_pair_printer(val):
   """Factory for an llvm::PointerIntPair printer."""

@@ -15,24 +15,26 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Optional.h"
 #include "llvm/Support/DataTypes.h"
 #include <cassert>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <type_traits>
 
 namespace llvm {
 
+class Duration;
 class formatv_object_base;
 class format_object_base;
 class FormattedString;
 class FormattedNumber;
 class FormattedBytes;
-template <class T> class LLVM_NODISCARD Expected;
+template <class T> class [[nodiscard]] Expected;
 
 namespace sys {
 namespace fs {
@@ -137,6 +139,13 @@ public:
   // Configuration Interface
   //===--------------------------------------------------------------------===//
 
+  /// If possible, pre-allocate \p ExtraSize bytes for stream data.
+  /// i.e. it extends internal buffers to keep additional ExtraSize bytes.
+  /// So that the stream could keep at least tell() + ExtraSize bytes
+  /// without re-allocations. reserveExtraSpace() does not change
+  /// the size/data of the stream.
+  virtual void reserveExtraSpace(uint64_t ExtraSize) {}
+
   /// Set the stream to be buffered, with an automatically determined buffer
   /// size.
   void SetBuffered();
@@ -223,6 +232,10 @@ public:
 
   raw_ostream &operator<<(const std::string &Str) {
     // Avoid the fast path, it would only increase code size for a marginal win.
+    return write(Str.data(), Str.length());
+  }
+
+  raw_ostream &operator<<(const std::string_view &Str) {
     return write(Str.data(), Str.length());
   }
 
@@ -313,6 +326,8 @@ public:
   // Enable or disable colors. Once enable_colors(false) is called,
   // changeColor() has no effect until enable_colors(true) is called.
   virtual void enable_colors(bool enable) { ColorEnabled = enable; }
+
+  bool colors_enabled() const { return ColorEnabled; }
 
   /// Tie this stream to the specified stream. Replaces any existing tied-to
   /// stream. Specifying a nullptr unties the stream.
@@ -426,6 +441,7 @@ class raw_fd_ostream : public raw_pwrite_stream {
   int FD;
   bool ShouldClose;
   bool SupportsSeeking = false;
+  bool IsRegularFile = false;
   mutable Optional<bool> HasColors;
 
 #ifdef _WIN32
@@ -496,6 +512,8 @@ public:
 
   bool supportsSeeking() const { return SupportsSeeking; }
 
+  bool isRegularFile() const { return IsRegularFile; }
+
   /// Flushes the stream and repositions the underlying file descriptor position
   /// to the offset specified from the beginning of the file.
   uint64_t seek(uint64_t off);
@@ -543,7 +561,7 @@ public:
   ///     });
   ///   }
   ///   @endcode
-  LLVM_NODISCARD Expected<sys::fs::FileLocker> lock();
+  [[nodiscard]] Expected<sys::fs::FileLocker> lock();
 
   /// Tries to lock the underlying file within the specified period.
   ///
@@ -552,8 +570,8 @@ public:
   ///          error code.
   ///
   /// It is used as @ref lock.
-  LLVM_NODISCARD
-  Expected<sys::fs::FileLocker> tryLockFor(std::chrono::milliseconds Timeout);
+  [[nodiscard]] Expected<sys::fs::FileLocker>
+  tryLockFor(Duration const &Timeout);
 };
 
 /// This returns a reference to a raw_fd_ostream for standard output. Use it
@@ -604,6 +622,9 @@ public:
 
 /// A raw_ostream that writes to an std::string.  This is a simple adaptor
 /// class. This class does not encounter output errors.
+/// raw_string_ostream operates without a buffer, delegating all memory
+/// management to the std::string. Thus the std::string is always up-to-date,
+/// may be used directly and there is no need to call flush().
 class raw_string_ostream : public raw_ostream {
   std::string &OS;
 
@@ -618,13 +639,14 @@ public:
   explicit raw_string_ostream(std::string &O) : OS(O) {
     SetUnbuffered();
   }
-  ~raw_string_ostream() override;
 
-  /// Flushes the stream contents to the target string and returns  the string's
-  /// reference.
-  std::string& str() {
-    flush();
-    return OS;
+  /// Returns the string's reference. In most cases it is better to simply use
+  /// the underlying std::string directly.
+  /// TODO: Consider removing this API.
+  std::string &str() { return OS; }
+
+  void reserveExtraSpace(uint64_t ExtraSize) override {
+    OS.reserve(tell() + ExtraSize);
   }
 };
 
@@ -659,6 +681,10 @@ public:
 
   /// Return a StringRef for the vector contents.
   StringRef str() const { return StringRef(OS.data(), OS.size()); }
+
+  void reserveExtraSpace(uint64_t ExtraSize) override {
+    OS.reserve(tell() + ExtraSize);
+  }
 };
 
 /// A raw_ostream that discards all output.
@@ -680,12 +706,39 @@ class buffer_ostream : public raw_svector_ostream {
   raw_ostream &OS;
   SmallVector<char, 0> Buffer;
 
-  virtual void anchor() override;
+  void anchor() override;
 
 public:
   buffer_ostream(raw_ostream &OS) : raw_svector_ostream(Buffer), OS(OS) {}
   ~buffer_ostream() override { OS << str(); }
 };
+
+class buffer_unique_ostream : public raw_svector_ostream {
+  std::unique_ptr<raw_ostream> OS;
+  SmallVector<char, 0> Buffer;
+
+  void anchor() override;
+
+public:
+  buffer_unique_ostream(std::unique_ptr<raw_ostream> OS)
+      : raw_svector_ostream(Buffer), OS(std::move(OS)) {
+    // Turn off buffering on OS, which we now own, to avoid allocating a buffer
+    // when the destructor writes only to be immediately flushed again.
+    this->OS->SetUnbuffered();
+  }
+  ~buffer_unique_ostream() override { *OS << str(); }
+};
+
+class Error;
+
+/// This helper creates an output stream and then passes it to \p Write.
+/// The stream created is based on the specified \p OutputFileName:
+/// llvm::outs for "-", raw_null_ostream for "/dev/null", and raw_fd_ostream
+/// for other names. For raw_fd_ostream instances, the stream writes to
+/// a temporary file. The final output file is atomically replaced with the
+/// temporary file after the \p Write function is finished.
+Error writeToOutput(StringRef OutputFileName,
+                    std::function<Error(raw_ostream &)> Write);
 
 } // end namespace llvm
 

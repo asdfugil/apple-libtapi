@@ -13,15 +13,17 @@
 #ifndef LLVM_UTILS_TABLEGEN_CODEGENINSTRUCTION_H
 #define LLVM_UTILS_TABLEGEN_CODEGENINSTRUCTION_H
 
+#include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MachineValueType.h"
-#include "llvm/Support/SMLoc.h"
 #include <cassert>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace llvm {
+class SMLoc;
 template <typename T> class ArrayRef;
   class Record;
   class DagInit;
@@ -106,7 +108,7 @@ template <typename T> class ArrayRef;
       /// DoNotEncode - Bools are set to true in this vector for each operand in
       /// the DisableEncoding list.  These should not be emitted by the code
       /// emitter.
-      std::vector<bool> DoNotEncode;
+      BitVector DoNotEncode;
 
       /// MIOperandInfo - Default MI operand type. Note an operand may be made
       /// up of multiple MI operands.
@@ -148,6 +150,9 @@ template <typename T> class ArrayRef;
     /// type (which is a record).
     std::vector<OperandInfo> OperandList;
 
+    /// SubOpAliases - List of alias names for suboperands.
+    StringMap<std::pair<unsigned, unsigned>> SubOpAliases;
+
     // Information gleaned from the operand list.
     bool isPredicable;
     bool hasOptionalDef;
@@ -178,11 +183,14 @@ template <typename T> class ArrayRef;
     /// operand. Otherwise, return false.
     bool hasOperandNamed(StringRef Name, unsigned &OpIdx) const;
 
+    bool hasSubOperandAlias(StringRef Name,
+                            std::pair<unsigned, unsigned> &SubOp) const;
+
     /// ParseOperandName - Parse an operand name like "$foo" or "$foo.bar",
     /// where $foo is a whole operand and $foo.bar refers to a suboperand.
     /// This aborts if the name is invalid.  If AllowWholeOp is true, references
     /// to operands with suboperands are allowed, otherwise not.
-    std::pair<unsigned,unsigned> ParseOperandName(const std::string &Op,
+    std::pair<unsigned,unsigned> ParseOperandName(StringRef Op,
                                                   bool AllowWholeOp = true);
 
     /// getFlattenedOperandNumber - Flatten a operand/suboperand pair into a
@@ -211,7 +219,7 @@ template <typename T> class ArrayRef;
       return false;
     }
 
-    void ProcessDisableEncoding(std::string Value);
+    void ProcessDisableEncoding(StringRef Value);
   };
 
 
@@ -270,6 +278,7 @@ template <typename T> class ArrayRef;
     bool hasExtraDefRegAllocReq : 1;
     bool isCodeGenOnly : 1;
     bool isPseudo : 1;
+    bool isMeta : 1;
     bool isRegSequence : 1;
     bool isExtractSubreg : 1;
     bool isInsertSubreg : 1;
@@ -311,17 +320,22 @@ template <typename T> class ArrayRef;
     // This can be used on intructions that use typeN or ptypeN to identify
     // operands that should be considered as pointers even though SelectionDAG
     // didn't make a distinction between integer and pointers.
-    bool isOperandAPointer(unsigned i) const {
-      return isOperandImpl(i, "IsPointer");
+    bool isInOperandAPointer(unsigned i) const {
+      return isOperandImpl("InOperandList", i, "IsPointer");
+    }
+
+    bool isOutOperandAPointer(unsigned i) const {
+      return isOperandImpl("OutOperandList", i, "IsPointer");
     }
 
     /// Check if the operand is required to be an immediate.
-    bool isOperandImmArg(unsigned i) const {
-      return isOperandImpl(i, "IsImmediate");
+    bool isInOperandImmArg(unsigned i) const {
+      return isOperandImpl("InOperandList", i, "IsImmediate");
     }
 
   private:
-    bool isOperandImpl(unsigned i, StringRef PropertyName) const;
+    bool isOperandImpl(StringRef OpListName, unsigned i,
+                       StringRef PropertyName) const;
   };
 
 

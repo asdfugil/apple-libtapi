@@ -18,17 +18,16 @@
 
 namespace llvm {
 
-class MCCFIInstruction;
-
 class AArch64FrameLowering : public TargetFrameLowering {
 public:
   explicit AArch64FrameLowering()
       : TargetFrameLowering(StackGrowsDown, Align(16), 0, Align(16),
                             true /*StackRealignable*/) {}
 
-  void
-  emitCalleeSavedFrameMoves(MachineBasicBlock &MBB,
-                            MachineBasicBlock::iterator MBBI) const override;
+  void emitCalleeSavedFrameMoves(MachineBasicBlock &MBB,
+                                 MachineBasicBlock::iterator MBBI) const;
+
+  void resetCFIToInitialState(MachineBasicBlock &MBB) const override;
 
   MachineBasicBlock::iterator
   eliminateCallFramePseudoInstr(MachineFunction &MF, MachineBasicBlock &MBB,
@@ -61,17 +60,11 @@ public:
                               MutableArrayRef<CalleeSavedInfo> CSI,
                               const TargetRegisterInfo *TRI) const override;
 
-  void insertAuthLR(MachineBasicBlock &MBB,
-                    int64_t ArgumentStackToRestore,
-                    DebugLoc DL) const;
-
   /// Can this function use the red zone for local allocations.
   bool canUseRedZone(const MachineFunction &MF) const;
 
   bool hasFP(const MachineFunction &MF) const override;
   bool hasReservedCallFrame(const MachineFunction &MF) const override;
-
-  bool hasSwiftExtendedFrame(const MachineFunction &MF) const;
 
   bool assignCalleeSavedSpillSlots(MachineFunction &MF,
                                    const TargetRegisterInfo *TRI,
@@ -91,7 +84,7 @@ public:
   TargetStackID::Value getStackIDForScalableVectors() const override;
 
   void processFunctionBeforeFrameFinalized(MachineFunction &MF,
-                                             RegScavenger *RS) const override;
+                                           RegScavenger *RS) const override;
 
   void
   processFunctionBeforeFrameIndicesReplaced(MachineFunction &MF,
@@ -114,7 +107,7 @@ public:
     default:
       return false;
     case TargetStackID::Default:
-    case TargetStackID::SVEVector:
+    case TargetStackID::ScalableVector:
     case TargetStackID::NoAlloc:
       return true;
     }
@@ -123,7 +116,7 @@ public:
   bool isStackIdSafeForLocalArea(unsigned StackId) const override {
     // We don't support putting SVE objects into the pre-allocated local
     // frame block at the moment.
-    return StackId != TargetStackID::SVEVector;
+    return StackId != TargetStackID::ScalableVector;
   }
 
   void
@@ -131,6 +124,16 @@ public:
                     SmallVectorImpl<int> &ObjectsToAllocate) const override;
 
 private:
+  /// Returns true if a homogeneous prolog or epilog code can be emitted
+  /// for the size optimization. If so, HOM_Prolog/HOM_Epilog pseudo
+  /// instructions are emitted in place. When Exit block is given, this check is
+  /// for epilog.
+  bool homogeneousPrologEpilog(MachineFunction &MF,
+                               MachineBasicBlock *Exit = nullptr) const;
+
+  /// Returns true if CSRs should be paired.
+  bool producePairRegisters(MachineFunction &MF) const;
+
   bool shouldCombineCSRLocalStackBump(MachineFunction &MF,
                                       uint64_t StackBumpBytes) const;
 
@@ -149,6 +152,18 @@ private:
 
   bool shouldCombineCSRLocalStackBumpInEpilogue(MachineBasicBlock &MBB,
                                                 unsigned StackBumpBytes) const;
+  void emitCalleeSavedGPRLocations(MachineBasicBlock &MBB,
+                                   MachineBasicBlock::iterator MBBI) const;
+  void emitCalleeSavedSVELocations(MachineBasicBlock &MBB,
+                                   MachineBasicBlock::iterator MBBI) const;
+  void emitCalleeSavedGPRRestores(MachineBasicBlock &MBB,
+                                  MachineBasicBlock::iterator MBBI) const;
+  void emitCalleeSavedSVERestores(MachineBasicBlock &MBB,
+                                  MachineBasicBlock::iterator MBBI) const;
+
+  /// Emit target zero call-used regs.
+  void emitZeroCallUsedRegs(BitVector RegsToZero,
+                            MachineBasicBlock &MBB) const override;
 };
 
 } // End llvm namespace

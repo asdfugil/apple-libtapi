@@ -13,6 +13,7 @@
 
 #include "Views/InstructionInfoView.h"
 #include "llvm/Support/FormattedStream.h"
+#include "llvm/Support/JSON.h"
 
 namespace llvm {
 namespace mca {
@@ -31,15 +32,31 @@ void InstructionInfoView::printView(raw_ostream &OS) const {
   TempStream << "\n\nInstruction Info:\n";
   TempStream << "[1]: #uOps\n[2]: Latency\n[3]: RThroughput\n"
              << "[4]: MayLoad\n[5]: MayStore\n[6]: HasSideEffects (U)\n";
+  if (PrintBarriers) {
+    TempStream << "[7]: LoadBarrier\n[8]: StoreBarrier\n";
+  }
   if (PrintEncodings) {
-    TempStream << "[7]: Encoding Size\n";
-    TempStream << "\n[1]    [2]    [3]    [4]    [5]    [6]    [7]    "
-               << "Encodings:                    Instructions:\n";
+    if (PrintBarriers) {
+      TempStream << "[9]: Encoding Size\n";
+      TempStream << "\n[1]    [2]    [3]    [4]    [5]    [6]    [7]    [8]    "
+                 << "[9]    Encodings:                    Instructions:\n";
+    } else {
+      TempStream << "[7]: Encoding Size\n";
+      TempStream << "\n[1]    [2]    [3]    [4]    [5]    [6]    [7]    "
+                 << "Encodings:                    Instructions:\n";
+    }
   } else {
-    TempStream << "\n[1]    [2]    [3]    [4]    [5]    [6]    Instructions:\n";
+    if (PrintBarriers) {
+      TempStream << "\n[1]    [2]    [3]    [4]    [5]    [6]    [7]    [8]    "
+                 << "Instructions:\n";
+    } else {
+      TempStream << "\n[1]    [2]    [3]    [4]    [5]    [6]    "
+                 << "Instructions:\n";
+    }
   }
 
-  for (auto I : enumerate(zip(IIVD, Source))) {
+  int Index = 0;
+  for (const auto &I : enumerate(zip(IIVD, Source))) {
     const InstructionInfoViewData &IIVDEntry = std::get<0>(I.value());
 
     TempStream << ' ' << IIVDEntry.NumMicroOpcodes << "    ";
@@ -53,8 +70,8 @@ void InstructionInfoView::printView(raw_ostream &OS) const {
     else if (IIVDEntry.Latency < 100)
       TempStream << ' ';
 
-    if (IIVDEntry.RThroughput.hasValue()) {
-      double RT = IIVDEntry.RThroughput.getValue();
+    if (IIVDEntry.RThroughput) {
+      double RT = IIVDEntry.RThroughput.value();
       TempStream << format("%.2f", RT) << ' ';
       if (RT < 10.0)
         TempStream << "  ";
@@ -66,6 +83,13 @@ void InstructionInfoView::printView(raw_ostream &OS) const {
     TempStream << (IIVDEntry.mayLoad ? " *     " : "       ");
     TempStream << (IIVDEntry.mayStore ? " *     " : "       ");
     TempStream << (IIVDEntry.hasUnmodeledSideEffects ? " U     " : "       ");
+
+    if (PrintBarriers) {
+      TempStream << (LoweredInsts[Index]->isALoadBarrier() ? " *     "
+                                                           : "       ");
+      TempStream << (LoweredInsts[Index]->isAStoreBarrier() ? " *     "
+                                                            : "       ");
+    }
 
     if (PrintEncodings) {
       StringRef Encoding(CE.getEncoding(I.index()));
@@ -82,6 +106,7 @@ void InstructionInfoView::printView(raw_ostream &OS) const {
 
     const MCInst &Inst = std::get<1>(I.value());
     TempStream << printInstructionString(Inst) << '\n';
+    ++Index;
   }
 
   TempStream.flush();
@@ -92,7 +117,7 @@ void InstructionInfoView::collectData(
     MutableArrayRef<InstructionInfoViewData> IIVD) const {
   const llvm::MCSubtargetInfo &STI = getSubTargetInfo();
   const MCSchedModel &SM = STI.getSchedModel();
-  for (auto I : zip(getSource(), IIVD)) {
+  for (const auto I : zip(getSource(), IIVD)) {
     const MCInst &Inst = std::get<0>(I);
     InstructionInfoViewData &IIVDEntry = std::get<1>(I);
     const MCInstrDesc &MCDesc = MCII.get(Inst.getOpcode());
@@ -117,6 +142,36 @@ void InstructionInfoView::collectData(
     IIVDEntry.mayStore = MCDesc.mayStore();
     IIVDEntry.hasUnmodeledSideEffects = MCDesc.hasUnmodeledSideEffects();
   }
+}
+
+// Construct a JSON object from a single InstructionInfoViewData object.
+json::Object
+InstructionInfoView::toJSON(const InstructionInfoViewData &IIVD) const {
+  json::Object JO({{"NumMicroOpcodes", IIVD.NumMicroOpcodes},
+                   {"Latency", IIVD.Latency},
+                   {"mayLoad", IIVD.mayLoad},
+                   {"mayStore", IIVD.mayStore},
+                   {"hasUnmodeledSideEffects", IIVD.hasUnmodeledSideEffects}});
+  JO.try_emplace("RThroughput", IIVD.RThroughput.value_or(0.0));
+  return JO;
+}
+
+json::Value InstructionInfoView::toJSON() const {
+  ArrayRef<llvm::MCInst> Source = getSource();
+  if (!Source.size())
+    return json::Value(0);
+
+  IIVDVec IIVD(Source.size());
+  collectData(IIVD);
+
+  json::Array InstInfo;
+  for (const auto &I : enumerate(IIVD)) {
+    const InstructionInfoViewData &IIVDEntry = I.value();
+    json::Object JO = toJSON(IIVDEntry);
+    JO.try_emplace("Instruction", (unsigned)I.index());
+    InstInfo.push_back(std::move(JO));
+  }
+  return json::Object({{"InstructionList", json::Value(std::move(InstInfo))}});
 }
 } // namespace mca.
 } // namespace llvm

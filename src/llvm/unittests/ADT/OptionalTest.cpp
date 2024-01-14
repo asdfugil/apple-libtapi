@@ -8,12 +8,13 @@
 
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest-spi.h"
 #include "gtest/gtest.h"
 
 #include <array>
-
+#include <utility>
 
 using namespace llvm;
 
@@ -26,11 +27,15 @@ static_assert(std::is_trivially_copyable<Optional<std::array<int, 3>>>::value,
 void OptionalWorksInConstexpr() {
   constexpr auto x1 = Optional<int>();
   constexpr Optional<int> x2{};
-  static_assert(!x1.hasValue() && !x2.hasValue(),
+  static_assert(!x1.has_value() && !x2.has_value(),
+                "Default construction and hasValue() are contexpr");
+  static_assert(!x1.has_value() && !x2.has_value(),
                 "Default construction and hasValue() are contexpr");
   constexpr auto y1 = Optional<int>(3);
   constexpr Optional<int> y2{3};
-  static_assert(y1.getValue() == y2.getValue() && y1.getValue() == 3,
+  static_assert(y1.value() == y2.value() && y1.value() == 3,
+                "Construction with value and getValue() are constexpr");
+  static_assert(y1.value() == y2.value() && y1.value() == 3,
                 "Construction with value and getValue() are constexpr");
   static_assert(Optional<int>{3} >= 2 && Optional<int>{1} < Optional<int>{2},
                 "Comparisons work in constexpr");
@@ -194,12 +199,20 @@ TEST(OptionalTest, NullCopyConstructionTest) {
   EXPECT_EQ(0u, NonDefaultConstructible::Destructions);
 }
 
+TEST(OptionalTest, InPlaceConstructionNonDefaultConstructibleTest) {
+  NonDefaultConstructible::ResetCounts();
+  { Optional<NonDefaultConstructible> A{std::in_place, 1}; }
+  EXPECT_EQ(0u, NonDefaultConstructible::CopyConstructions);
+  EXPECT_EQ(0u, NonDefaultConstructible::CopyAssignments);
+  EXPECT_EQ(1u, NonDefaultConstructible::Destructions);
+}
+
 TEST(OptionalTest, GetValueOr) {
   Optional<int> A;
-  EXPECT_EQ(42, A.getValueOr(42));
+  EXPECT_EQ(42, A.value_or(42));
 
   A = 5;
-  EXPECT_EQ(5, A.getValueOr(42));
+  EXPECT_EQ(5, A.value_or(42));
 }
 
 struct MultiArgConstructor {
@@ -212,6 +225,11 @@ struct MultiArgConstructor {
   MultiArgConstructor(MultiArgConstructor &&) = delete;
   MultiArgConstructor &operator=(const MultiArgConstructor &) = delete;
   MultiArgConstructor &operator=(MultiArgConstructor &&) = delete;
+
+  friend bool operator==(const MultiArgConstructor &LHS,
+                         const MultiArgConstructor &RHS) {
+    return LHS.x == RHS.x && LHS.y == RHS.y;
+  }
 
   static unsigned Destructions;
   ~MultiArgConstructor() {
@@ -229,18 +247,50 @@ static_assert(!std::is_trivially_copyable<Optional<MultiArgConstructor>>::value,
 TEST(OptionalTest, Emplace) {
   MultiArgConstructor::ResetCounts();
   Optional<MultiArgConstructor> A;
-  
+
   A.emplace(1, 2);
-  EXPECT_TRUE(A.hasValue());
+  EXPECT_TRUE(A.has_value());
+  EXPECT_TRUE(A.has_value());
   EXPECT_EQ(1, A->x);
   EXPECT_EQ(2, A->y);
   EXPECT_EQ(0u, MultiArgConstructor::Destructions);
 
   A.emplace(5, false);
-  EXPECT_TRUE(A.hasValue());
+  EXPECT_TRUE(A.has_value());
+  EXPECT_TRUE(A.has_value());
   EXPECT_EQ(5, A->x);
   EXPECT_EQ(-5, A->y);
   EXPECT_EQ(1u, MultiArgConstructor::Destructions);
+}
+
+TEST(OptionalTest, InPlaceConstructionMultiArgConstructorTest) {
+  MultiArgConstructor::ResetCounts();
+  {
+    Optional<MultiArgConstructor> A{std::in_place, 1, 2};
+    EXPECT_TRUE(A.has_value());
+    EXPECT_TRUE(A.has_value());
+    EXPECT_EQ(1, A->x);
+    EXPECT_EQ(2, A->y);
+    Optional<MultiArgConstructor> B{std::in_place, 5, false};
+    EXPECT_TRUE(B.has_value());
+    EXPECT_TRUE(B.has_value());
+    EXPECT_EQ(5, B->x);
+    EXPECT_EQ(-5, B->y);
+    EXPECT_EQ(0u, MultiArgConstructor::Destructions);
+  }
+  EXPECT_EQ(2u, MultiArgConstructor::Destructions);
+}
+
+TEST(OptionalTest, InPlaceConstructionAndEmplaceEquivalentTest) {
+  MultiArgConstructor::ResetCounts();
+  {
+    Optional<MultiArgConstructor> A{std::in_place, 1, 2};
+    Optional<MultiArgConstructor> B;
+    B.emplace(1, 2);
+    EXPECT_EQ(0u, MultiArgConstructor::Destructions);
+    ASSERT_EQ(A, B);
+  }
+  EXPECT_EQ(2u, MultiArgConstructor::Destructions);
 }
 
 struct MoveOnly {
@@ -390,26 +440,202 @@ TEST(OptionalTest, ImmovableEmplace) {
   EXPECT_EQ(0u, Immovable::Destructions);
 }
 
-#if LLVM_HAS_RVALUE_REFERENCE_THIS
+TEST(OptionalTest, ImmovableInPlaceConstruction) {
+  Immovable::ResetCounts();
+  Optional<Immovable> A{std::in_place, 4};
+  EXPECT_TRUE((bool)A);
+  EXPECT_EQ(4, A->val);
+  EXPECT_EQ(1u, Immovable::Constructions);
+  EXPECT_EQ(0u, Immovable::Destructions);
+}
 
-TEST(OptionalTest, MoveGetValueOr) {
+// Craft a class which is_trivially_copyable, but not
+// is_trivially_copy_constructible.
+struct NonTCopy {
+  NonTCopy() = default;
+
+  // Delete the volatile copy constructor to engage the "rule of 3" and delete
+  // any unspecified copy assignment or constructor.
+  NonTCopy(volatile NonTCopy const &) = delete;
+
+  // Leave the non-volatile default copy constructor unspecified (deleted by
+  // rule of 3)
+
+  // This template can serve as the copy constructor, but isn't chosen
+  // by =default in a class with a 'NonTCopy' member.
+  template <typename Self = NonTCopy>
+  NonTCopy(Self const &Other) : Val(Other.Val) {}
+
+  NonTCopy &operator=(NonTCopy const &) = default;
+
+  int Val{0};
+};
+
+#if defined(_MSC_VER) && _MSC_VER >= 1927 && !defined(__clang__)
+// Currently only true on recent MSVC releases.
+static_assert(std::is_trivially_copyable<NonTCopy>::value,
+              "Expect NonTCopy to be trivially copyable");
+
+static_assert(!std::is_trivially_copy_constructible<NonTCopy>::value,
+              "Expect NonTCopy not to be trivially copy constructible.");
+#endif // defined(_MSC_VER) && _MSC_VER >= 1927
+
+TEST(OptionalTest, DeletedCopyConstructor) {
+
+  // Expect compile to fail if 'trivial' version of
+  // optional_detail::OptionalStorage is chosen.
+  using NonTCopyOptT = Optional<NonTCopy>;
+  NonTCopyOptT NonTCopy1;
+
+  // Check that the Optional can be copy constructed.
+  NonTCopyOptT NonTCopy2{NonTCopy1};
+
+  // Check that the Optional can be copy assigned.
+  NonTCopy1 = NonTCopy2;
+}
+
+// Craft a class which is_trivially_copyable, but not
+// is_trivially_copy_assignable.
+class NonTAssign {
+public:
+  NonTAssign() = default;
+  NonTAssign(NonTAssign const &) = default;
+
+  // Delete the volatile copy assignment to engage the "rule of 3" and delete
+  // any unspecified copy assignment or constructor.
+  NonTAssign &operator=(volatile NonTAssign const &) = delete;
+
+  // Leave the non-volatile default copy assignment unspecified (deleted by rule
+  // of 3).
+
+  // This template can serve as the copy assignment, but isn't chosen
+  // by =default in a class with a 'NonTAssign' member.
+  template <typename Self = NonTAssign>
+  NonTAssign &operator=(Self const &Other) {
+    A = Other.A;
+    return *this;
+  }
+
+  int A{0};
+};
+
+#if defined(_MSC_VER) && _MSC_VER >= 1927 && !defined(__clang__)
+// Currently only true on recent MSVC releases.
+static_assert(std::is_trivially_copyable<NonTAssign>::value,
+              "Expect NonTAssign to be trivially copyable");
+
+static_assert(!std::is_trivially_copy_assignable<NonTAssign>::value,
+              "Expect NonTAssign not to be trivially assignable.");
+#endif // defined(_MSC_VER) && _MSC_VER >= 1927
+
+TEST(OptionalTest, DeletedCopyAssignment) {
+
+  // Expect compile to fail if 'trivial' version of
+  // optional_detail::OptionalStorage is chosen.
+  using NonTAssignOptT = Optional<NonTAssign>;
+  NonTAssignOptT NonTAssign1;
+
+  // Check that the Optional can be copy constructed.
+  NonTAssignOptT NonTAssign2{NonTAssign1};
+
+  // Check that the Optional can be copy assigned.
+  NonTAssign1 = NonTAssign2;
+}
+
+struct NoTMove {
+  NoTMove() = default;
+  NoTMove(NoTMove const &) = default;
+  NoTMove &operator=(NoTMove const &) = default;
+
+  // Delete move constructor / assignment.  Compiler should fall-back to the
+  // trivial copy constructor / assignment in the trivial OptionalStorage
+  // specialization.
+  NoTMove(NoTMove &&) = delete;
+  NoTMove &operator=(NoTMove &&) = delete;
+
+  int Val{0};
+};
+
+TEST(OptionalTest, DeletedMoveConstructor) {
+  using NoTMoveOptT = Optional<NoTMove>;
+
+  NoTMoveOptT NonTMove1;
+  NoTMoveOptT NonTMove2{std::move(NonTMove1)};
+
+  NonTMove1 = std::move(NonTMove2);
+
+  static_assert(
+      std::is_trivially_copyable<NoTMoveOptT>::value,
+      "Expect Optional<NoTMove> to still use the trivial specialization "
+      "of OptionalStorage despite the deleted move constructor / assignment.");
+}
+
+class NoCopyStringMap {
+public:
+  NoCopyStringMap() = default;
+
+private:
+  llvm::StringMap<std::unique_ptr<int>> Map;
+};
+
+TEST(OptionalTest, DeletedCopyStringMap) {
+  // Old versions of gcc (7.3 and prior) instantiate the copy constructor when
+  // std::is_trivially_copyable is instantiated.  This test will fail
+  // compilation if std::is_trivially_copyable is used in the OptionalStorage
+  // specialization condition by gcc <= 7.3.
+  Optional<NoCopyStringMap> TestInstantiation;
+}
+
+TEST(OptionalTest, MoveValueOr) {
   Optional<MoveOnly> A;
 
   MoveOnly::ResetCounts();
-  EXPECT_EQ(42, std::move(A).getValueOr(MoveOnly(42)).val);
+  EXPECT_EQ(42, std::move(A).value_or(MoveOnly(42)).val);
   EXPECT_EQ(1u, MoveOnly::MoveConstructions);
   EXPECT_EQ(0u, MoveOnly::MoveAssignments);
   EXPECT_EQ(2u, MoveOnly::Destructions);
 
   A = MoveOnly(5);
   MoveOnly::ResetCounts();
-  EXPECT_EQ(5, std::move(A).getValueOr(MoveOnly(42)).val);
+  EXPECT_EQ(5, std::move(A).value_or(MoveOnly(42)).val);
   EXPECT_EQ(1u, MoveOnly::MoveConstructions);
   EXPECT_EQ(0u, MoveOnly::MoveAssignments);
   EXPECT_EQ(2u, MoveOnly::Destructions);
 }
 
-#endif // LLVM_HAS_RVALUE_REFERENCE_THIS
+TEST(OptionalTest, Transform) {
+  Optional<int> A;
+
+  Optional<int> B = A.transform([&](int N) { return N + 1; });
+  EXPECT_FALSE(B.has_value());
+
+  A = 3;
+  Optional<int> C = A.transform([&](int N) { return N + 1; });
+  EXPECT_TRUE(C.has_value());
+  EXPECT_EQ(4, C.value());
+}
+
+TEST(OptionalTest, MoveTransform) {
+  Optional<MoveOnly> A;
+
+  MoveOnly::ResetCounts();
+  Optional<int> B =
+      std::move(A).transform([&](const MoveOnly &M) { return M.val + 2; });
+  EXPECT_FALSE(B.has_value());
+  EXPECT_EQ(0u, MoveOnly::MoveConstructions);
+  EXPECT_EQ(0u, MoveOnly::MoveAssignments);
+  EXPECT_EQ(0u, MoveOnly::Destructions);
+
+  A = MoveOnly(5);
+  MoveOnly::ResetCounts();
+  Optional<int> C =
+      std::move(A).transform([&](const MoveOnly &M) { return M.val + 2; });
+  EXPECT_TRUE(C.has_value());
+  EXPECT_EQ(7, C.value());
+  EXPECT_EQ(0u, MoveOnly::MoveConstructions);
+  EXPECT_EQ(0u, MoveOnly::MoveAssignments);
+  EXPECT_EQ(0u, MoveOnly::Destructions);
+}
 
 struct EqualTo {
   template <typename T, typename U> static bool apply(const T &X, const U &Y) {
@@ -589,10 +815,11 @@ TEST(OptionalTest, UseInUnitTests) {
   // Test that we invoke the streaming operators when pretty-printing values in
   // EXPECT macros.
   EXPECT_NONFATAL_FAILURE(EXPECT_EQ(llvm::None, ComparableAndStreamable::get()),
-                          "Expected: llvm::None\n"
-                          "      Which is: None\n"
-                          "To be equal to: ComparableAndStreamable::get()\n"
-                          "      Which is: ComparableAndStreamable");
+                          "Expected equality of these values:\n"
+                          "  llvm::None\n"
+                          "    Which is: None\n"
+                          "  ComparableAndStreamable::get()\n"
+                          "    Which is: ComparableAndStreamable");
 
   // Test that it is still possible to compare objects which do not have a
   // custom streaming operator.
@@ -614,6 +841,17 @@ TEST(OptionalTest, HashValue) {
 
   // Check None hash the same way regardless of type.
   EXPECT_EQ(hash_value(B), hash_value(I));
+}
+
+struct NotTriviallyCopyable {
+  NotTriviallyCopyable(); // Constructor out-of-line.
+  virtual ~NotTriviallyCopyable() = default;
+  Optional<MoveOnly> MO;
+};
+
+TEST(OptionalTest, GCCIsTriviallyMoveConstructibleCompat) {
+  Optional<NotTriviallyCopyable> V;
+  EXPECT_FALSE(V);
 }
 
 } // end anonymous namespace

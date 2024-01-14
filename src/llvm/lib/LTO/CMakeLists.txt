@@ -1,5 +1,4 @@
 add_llvm_component_library(LLVMLTO
-  Caching.cpp
   LTO.cpp
   LTOBackend.cpp
   LTOModule.cpp
@@ -20,17 +19,20 @@ add_llvm_component_library(LLVMLTO
   BinaryFormat
   BitReader
   BitWriter
+  CAS
   CodeGen
   Core
   Extensions
   IPO
   InstCombine
+  Instrumentation
   Linker
   MC
   ObjCARC
   Object
   Passes
   Remarks
+  RemoteCachingService
   Scalar
   Support
   Target

@@ -87,7 +87,7 @@ static MCOperand lowerSymbolOperand(const MachineOperand &MO, MCSymbol *Sym,
   return MCOperand::createExpr(ME);
 }
 
-bool llvm::LowerRISCVMachineOperandToMCOperand(const MachineOperand &MO,
+bool llvm::lowerRISCVMachineOperandToMCOperand(const MachineOperand &MO,
                                                MCOperand &MCOp,
                                                const AsmPrinter &AP) {
   switch (MO.getType()) {
@@ -109,7 +109,7 @@ bool llvm::LowerRISCVMachineOperandToMCOperand(const MachineOperand &MO,
     MCOp = lowerSymbolOperand(MO, MO.getMBB()->getSymbol(), AP);
     break;
   case MachineOperand::MO_GlobalAddress:
-    MCOp = lowerSymbolOperand(MO, AP.getSymbol(MO.getGlobal()), AP);
+    MCOp = lowerSymbolOperand(MO, AP.getSymbolPreferLocal(*MO.getGlobal()), AP);
     break;
   case MachineOperand::MO_BlockAddress:
     MCOp = lowerSymbolOperand(
@@ -124,6 +124,9 @@ bool llvm::LowerRISCVMachineOperandToMCOperand(const MachineOperand &MO,
     break;
   case MachineOperand::MO_JumpTableIndex:
     MCOp = lowerSymbolOperand(MO, AP.GetJTISymbol(MO.getIndex()), AP);
+    break;
+  case MachineOperand::MO_MCSymbol:
+    MCOp = lowerSymbolOperand(MO, MO.getMCSymbol(), AP);
     break;
   }
   return true;
@@ -145,29 +148,51 @@ static bool lowerRISCVVMachineInstrToMCInst(const MachineInstr *MI,
 
   const TargetRegisterInfo *TRI =
       MF->getSubtarget<RISCVSubtarget>().getRegisterInfo();
+
   assert(TRI && "TargetRegisterInfo expected");
 
-  for (const MachineOperand &MO : MI->explicit_operands()) {
-    int OpNo = (int)MI->getOperandNo(&MO);
-    assert(OpNo >= 0 && "Operand number doesn't fit in an 'int' type");
+  uint64_t TSFlags = MI->getDesc().TSFlags;
+  unsigned NumOps = MI->getNumExplicitOperands();
 
-    // Skip VL, SEW and MergeOp operands
-    if (OpNo == RVV->getVLIndex() || OpNo == RVV->getSEWIndex() ||
-        OpNo == RVV->getMergeOpIndex())
+  // Skip policy, VL and SEW operands which are the last operands if present.
+  if (RISCVII::hasVecPolicyOp(TSFlags))
+    --NumOps;
+  if (RISCVII::hasVLOp(TSFlags))
+    --NumOps;
+  if (RISCVII::hasSEWOp(TSFlags))
+    --NumOps;
+
+  bool hasVLOutput = RISCV::isFaultFirstLoad(*MI);
+  for (unsigned OpNo = 0; OpNo != NumOps; ++OpNo) {
+    const MachineOperand &MO = MI->getOperand(OpNo);
+    // Skip vl ouput. It should be the second output.
+    if (hasVLOutput && OpNo == 1)
       continue;
+
+    // Skip merge op. It should be the first operand after the result.
+    if (RISCVII::hasMergeOp(TSFlags) && OpNo == 1U + hasVLOutput) {
+      assert(MI->getNumExplicitDefs() == 1U + hasVLOutput);
+      continue;
+    }
 
     MCOperand MCOp;
     switch (MO.getType()) {
     default:
       llvm_unreachable("Unknown operand type");
     case MachineOperand::MO_Register: {
-      unsigned Reg = MO.getReg();
+      Register Reg = MO.getReg();
 
       if (RISCV::VRM2RegClass.contains(Reg) ||
           RISCV::VRM4RegClass.contains(Reg) ||
           RISCV::VRM8RegClass.contains(Reg)) {
-        Reg = TRI->getSubReg(Reg, RISCV::sub_vrm2);
+        Reg = TRI->getSubReg(Reg, RISCV::sub_vrm1_0);
         assert(Reg && "Subregister does not exist");
+      } else if (RISCV::FPR16RegClass.contains(Reg)) {
+        Reg = TRI->getMatchingSuperReg(Reg, RISCV::sub_16, &RISCV::FPR32RegClass);
+        assert(Reg && "Subregister does not exist");
+      } else if (RISCV::FPR64RegClass.contains(Reg)) {
+        Reg = TRI->getSubReg(Reg, RISCV::sub_32);
+        assert(Reg && "Superregister does not exist");
       }
 
       MCOp = MCOperand::createReg(Reg);
@@ -182,22 +207,51 @@ static bool lowerRISCVVMachineInstrToMCInst(const MachineInstr *MI,
 
   // Unmasked pseudo instructions need to append dummy mask operand to
   // V instructions. All V instructions are modeled as the masked version.
-  if (RVV->hasDummyMask())
+  if (RISCVII::hasDummyMaskOp(TSFlags))
     OutMI.addOperand(MCOperand::createReg(RISCV::NoRegister));
 
   return true;
 }
 
-void llvm::LowerRISCVMachineInstrToMCInst(const MachineInstr *MI, MCInst &OutMI,
-                                          const AsmPrinter &AP) {
+bool llvm::lowerRISCVMachineInstrToMCInst(const MachineInstr *MI, MCInst &OutMI,
+                                          AsmPrinter &AP) {
   if (lowerRISCVVMachineInstrToMCInst(MI, OutMI))
-    return;
+    return false;
 
   OutMI.setOpcode(MI->getOpcode());
 
   for (const MachineOperand &MO : MI->operands()) {
     MCOperand MCOp;
-    if (LowerRISCVMachineOperandToMCOperand(MO, MCOp, AP))
+    if (lowerRISCVMachineOperandToMCOperand(MO, MCOp, AP))
       OutMI.addOperand(MCOp);
   }
+
+  switch (OutMI.getOpcode()) {
+  case TargetOpcode::PATCHABLE_FUNCTION_ENTER: {
+    const Function &F = MI->getParent()->getParent()->getFunction();
+    if (F.hasFnAttribute("patchable-function-entry")) {
+      unsigned Num;
+      if (F.getFnAttribute("patchable-function-entry")
+              .getValueAsString()
+              .getAsInteger(10, Num))
+        return false;
+      AP.emitNops(Num);
+      return true;
+    }
+    break;
+  }
+  case RISCV::PseudoReadVLENB:
+    OutMI.setOpcode(RISCV::CSRRS);
+    OutMI.addOperand(MCOperand::createImm(
+        RISCVSysReg::lookupSysRegByName("VLENB")->Encoding));
+    OutMI.addOperand(MCOperand::createReg(RISCV::X0));
+    break;
+  case RISCV::PseudoReadVL:
+    OutMI.setOpcode(RISCV::CSRRS);
+    OutMI.addOperand(
+        MCOperand::createImm(RISCVSysReg::lookupSysRegByName("VL")->Encoding));
+    OutMI.addOperand(MCOperand::createReg(RISCV::X0));
+    break;
+  }
+  return false;
 }

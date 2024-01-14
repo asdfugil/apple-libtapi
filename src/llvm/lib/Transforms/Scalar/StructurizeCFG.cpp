@@ -12,16 +12,15 @@
 #include "llvm/ADT/SCCIterator.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/InstructionSimplify.h"
 #include "llvm/Analysis/LegacyDivergenceAnalysis.h"
 #include "llvm/Analysis/RegionInfo.h"
 #include "llvm/Analysis/RegionIterator.h"
 #include "llvm/Analysis/RegionPass.h"
-#include "llvm/IR/Argument.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
-#include "llvm/IR/Constant.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
@@ -33,7 +32,6 @@
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Use.h"
-#include "llvm/IR/User.h"
 #include "llvm/IR/Value.h"
 #include "llvm/IR/ValueHandle.h"
 #include "llvm/InitializePasses.h"
@@ -41,7 +39,6 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils.h"
@@ -250,6 +247,7 @@ class StructurizeCFG {
 
   SmallVector<RegionNode *, 8> Order;
   BBSet Visited;
+  BBSet FlowSet;
 
   SmallVector<WeakVH, 8> AffectedPhis;
   BBPhiMap DeletedPhis;
@@ -276,10 +274,15 @@ class StructurizeCFG {
 
   void insertConditions(bool Loops);
 
+  void simplifyConditions();
+
   void delPhiValues(BasicBlock *From, BasicBlock *To);
 
   void addPhiValues(BasicBlock *From, BasicBlock *To);
 
+  void findUndefBlocks(BasicBlock *PHIBlock,
+                       const SmallSet<BasicBlock *, 8> &Incomings,
+                       SmallVector<BasicBlock *> &UndefBlks) const;
   void setPhiValues();
 
   void simplifyAffectedPhis();
@@ -397,7 +400,7 @@ void StructurizeCFG::orderNodes() {
         WorkList.emplace_back(I, I + Size);
 
       // Add the SCC nodes to the Order array.
-      for (auto &N : SCC) {
+      for (const auto &N : SCC) {
         assert(I < E && "SCC size mismatch!");
         Order[I++] = N.first;
       }
@@ -586,6 +589,28 @@ void StructurizeCFG::insertConditions(bool Loops) {
   }
 }
 
+/// Simplify any inverted conditions that were built by buildConditions.
+void StructurizeCFG::simplifyConditions() {
+  SmallVector<Instruction *> InstToErase;
+  for (auto &I : concat<PredMap::value_type>(Predicates, LoopPreds)) {
+    auto &Preds = I.second;
+    for (auto &J : Preds) {
+      auto &Cond = J.second;
+      Instruction *Inverted;
+      if (match(Cond, m_Not(m_OneUse(m_Instruction(Inverted)))) &&
+          !Cond->use_empty()) {
+        if (auto *InvertedCmp = dyn_cast<CmpInst>(Inverted)) {
+          InvertedCmp->setPredicate(InvertedCmp->getInversePredicate());
+          Cond->replaceAllUsesWith(InvertedCmp);
+          InstToErase.push_back(cast<Instruction>(Cond));
+        }
+      }
+    }
+  }
+  for (auto *I : InstToErase)
+    I->eraseFromParent();
+}
+
 /// Remove all PHI values coming from "From" into "To" and remember
 /// them in DeletedPhis
 void StructurizeCFG::delPhiValues(BasicBlock *From, BasicBlock *To) {
@@ -612,6 +637,67 @@ void StructurizeCFG::addPhiValues(BasicBlock *From, BasicBlock *To) {
   AddedPhis[To].push_back(From);
 }
 
+/// When we are reconstructing a PHI inside \p PHIBlock with incoming values
+/// from predecessors \p Incomings, we have a chance to mark the available value
+/// from some blocks as undefined. The function will find out all such blocks
+/// and return in \p UndefBlks.
+void StructurizeCFG::findUndefBlocks(
+    BasicBlock *PHIBlock, const SmallSet<BasicBlock *, 8> &Incomings,
+    SmallVector<BasicBlock *> &UndefBlks) const {
+  //  We may get a post-structured CFG like below:
+  //
+  //  | P1
+  //  |/
+  //  F1
+  //  |\
+  //  | N
+  //  |/
+  //  F2
+  //  |\
+  //  | P2
+  //  |/
+  //  F3
+  //  |\
+  //  B
+  //
+  // B is the block that has a PHI being reconstructed. P1/P2 are predecessors
+  // of B before structurization. F1/F2/F3 are flow blocks inserted during
+  // structurization process. Block N is not a predecessor of B before
+  // structurization, but are placed between the predecessors(P1/P2) of B after
+  // structurization. This usually means that threads went to N never take the
+  // path N->F2->F3->B. For example, the threads take the branch F1->N may
+  // always take the branch F2->P2. So, when we are reconstructing a PHI
+  // originally in B, we can safely say the incoming value from N is undefined.
+  SmallSet<BasicBlock *, 8> VisitedBlock;
+  SmallVector<BasicBlock *, 8> Stack;
+  if (PHIBlock == ParentRegion->getExit()) {
+    for (auto P : predecessors(PHIBlock)) {
+      if (ParentRegion->contains(P))
+        Stack.push_back(P);
+    }
+  } else {
+    append_range(Stack, predecessors(PHIBlock));
+  }
+
+  // Do a backward traversal over the CFG, and stop further searching if
+  // the block is not a Flow. If a block is neither flow block nor the
+  // incoming predecessor, then the incoming value from the block is
+  // undefined value for the PHI being reconstructed.
+  while (!Stack.empty()) {
+    BasicBlock *Current = Stack.pop_back_val();
+    if (VisitedBlock.contains(Current))
+      continue;
+
+    VisitedBlock.insert(Current);
+    if (FlowSet.contains(Current)) {
+      for (auto P : predecessors(Current))
+        Stack.push_back(P);
+    } else if (!Incomings.contains(Current)) {
+      UndefBlks.push_back(Current);
+    }
+  }
+}
+
 /// Add the real PHI value as soon as everything is set up
 void StructurizeCFG::setPhiValues() {
   SmallVector<PHINode *, 8> InsertedPhis;
@@ -623,6 +709,8 @@ void StructurizeCFG::setPhiValues() {
     if (!DeletedPhis.count(To))
       continue;
 
+    SmallVector<BasicBlock *> UndefBlks;
+    bool CachedUndefs = false;
     PhiMap &Map = DeletedPhis[To];
     for (const auto &PI : Map) {
       PHINode *Phi = PI.first;
@@ -631,15 +719,30 @@ void StructurizeCFG::setPhiValues() {
       Updater.AddAvailableValue(&Func->getEntryBlock(), Undef);
       Updater.AddAvailableValue(To, Undef);
 
-      NearestCommonDominator Dominator(DT);
-      Dominator.addBlock(To);
+      SmallSet<BasicBlock *, 8> Incomings;
+      SmallVector<BasicBlock *> ConstantPreds;
       for (const auto &VI : PI.second) {
+        Incomings.insert(VI.first);
         Updater.AddAvailableValue(VI.first, VI.second);
-        Dominator.addAndRememberBlock(VI.first);
+        if (isa<Constant>(VI.second))
+          ConstantPreds.push_back(VI.first);
       }
 
-      if (!Dominator.resultIsRememberedBlock())
-        Updater.AddAvailableValue(Dominator.result(), Undef);
+      if (!CachedUndefs) {
+        findUndefBlocks(To, Incomings, UndefBlks);
+        CachedUndefs = true;
+      }
+
+      for (auto UB : UndefBlks) {
+        // If this undef block is dominated by any predecessor(before
+        // structurization) of reconstructed PHI with constant incoming value,
+        // don't mark the available value as undefined. Setting undef to such
+        // block will stop us from getting optimal phi insertion.
+        if (any_of(ConstantPreds,
+                   [&](BasicBlock *CP) { return DT->dominates(CP, UB); }))
+          continue;
+        Updater.AddAvailableValue(UB, Undef);
+      }
 
       for (BasicBlock *FI : From)
         Phi->setIncomingValueForBlock(FI, Updater.GetValueAtEndOfBlock(FI));
@@ -659,9 +762,12 @@ void StructurizeCFG::simplifyAffectedPhis() {
     Changed = false;
     SimplifyQuery Q(Func->getParent()->getDataLayout());
     Q.DT = DT;
+    // Setting CanUseUndef to true might extend value liveness, set it to false
+    // to achieve better register pressure.
+    Q.CanUseUndef = false;
     for (WeakVH VH : AffectedPhis) {
       if (auto Phi = dyn_cast_or_null<PHINode>(VH)) {
-        if (auto NewValue = SimplifyInstruction(Phi, Q)) {
+        if (auto NewValue = simplifyInstruction(Phi, Q)) {
           Phi->replaceAllUsesWith(NewValue);
           Phi->eraseFromParent();
           Changed = true;
@@ -677,9 +783,8 @@ void StructurizeCFG::killTerminator(BasicBlock *BB) {
   if (!Term)
     return;
 
-  for (succ_iterator SI = succ_begin(BB), SE = succ_end(BB);
-       SI != SE; ++SI)
-    delPhiValues(BB, *SI);
+  for (BasicBlock *Succ : successors(BB))
+    delPhiValues(BB, Succ);
 
   if (DA)
     DA->removeValue(Term);
@@ -694,11 +799,9 @@ void StructurizeCFG::changeExit(RegionNode *Node, BasicBlock *NewExit,
     BasicBlock *OldExit = SubRegion->getExit();
     BasicBlock *Dominator = nullptr;
 
-    // Find all the edges from the sub region to the exit
-    for (auto BBI = pred_begin(OldExit), E = pred_end(OldExit); BBI != E;) {
-      // Incrememt BBI before mucking with BB's terminator.
-      BasicBlock *BB = *BBI++;
-
+    // Find all the edges from the sub region to the exit.
+    // We use make_early_inc_range here because we modify BB's terminator.
+    for (BasicBlock *BB : llvm::make_early_inc_range(predecessors(OldExit))) {
       if (!SubRegion->contains(BB))
         continue;
 
@@ -739,6 +842,7 @@ BasicBlock *StructurizeCFG::getNextFlow(BasicBlock *Dominator) {
                        Order.back()->getEntry();
   BasicBlock *Flow = BasicBlock::Create(Context, FlowBlockName,
                                         Func, Insert);
+  FlowSet.insert(Flow);
   DT->addNewBlock(Flow, Dominator);
   ParentRegion->getRegionInfo()->setRegionFor(Flow, ParentRegion);
   return Flow;
@@ -868,20 +972,7 @@ void StructurizeCFG::handleLoops(bool ExitUseAllowed,
     handleLoops(false, LoopEnd);
   }
 
-  // If the start of the loop is the entry block, we can't branch to it so
-  // insert a new dummy entry block.
-  Function *LoopFunc = LoopStart->getParent();
-  if (LoopStart == &LoopFunc->getEntryBlock()) {
-    LoopStart->setName("entry.orig");
-
-    BasicBlock *NewEntry =
-      BasicBlock::Create(LoopStart->getContext(),
-                         "entry",
-                         LoopFunc,
-                         LoopStart);
-    BranchInst::Create(LoopStart, NewEntry);
-    DT->setNewRoot(NewEntry);
-  }
+  assert(LoopStart != &LoopStart->getParent()->getEntryBlock());
 
   // Create an extra loop end node
   LoopEnd = needPrefix(false);
@@ -924,10 +1015,9 @@ void StructurizeCFG::rebuildSSA() {
   for (BasicBlock *BB : ParentRegion->blocks())
     for (Instruction &I : *BB) {
       bool Initialized = false;
-      // We may modify the use list as we iterate over it, so be careful to
-      // compute the next element in the use list at the top of the loop.
-      for (auto UI = I.use_begin(), E = I.use_end(); UI != E;) {
-        Use &U = *UI++;
+      // We may modify the use list as we iterate over it, so we use
+      // make_early_inc_range.
+      for (Use &U : llvm::make_early_inc_range(I.uses())) {
         Instruction *User = cast<Instruction>(U.getUser());
         if (User->getParent() == BB) {
           continue;
@@ -958,7 +1048,7 @@ static bool hasOnlyUniformBranches(Region *R, unsigned UniformMDKindID,
   // Count of how many direct children are conditional.
   unsigned ConditionalDirectChildren = 0;
 
-  for (auto E : R->elements()) {
+  for (auto *E : R->elements()) {
     if (!E->isSubRegion()) {
       auto Br = dyn_cast<BranchInst>(E->getEntry()->getTerminator());
       if (!Br || !Br->isConditional())
@@ -982,7 +1072,7 @@ static bool hasOnlyUniformBranches(Region *R, unsigned UniformMDKindID,
       // their direct child basic blocks' terminators, regardless of whether
       // subregions are uniform or not. However, this requires a very careful
       // look at SIAnnotateControlFlow to make sure nothing breaks there.
-      for (auto BB : E->getNodeAs<Region>()->blocks()) {
+      for (auto *BB : E->getNodeAs<Region>()->blocks()) {
         auto Br = dyn_cast<BranchInst>(BB->getTerminator());
         if (!Br || !Br->isConditional())
           continue;
@@ -1070,6 +1160,7 @@ bool StructurizeCFG::run(Region *R, DominatorTree *DT) {
   insertConditions(false);
   insertConditions(true);
   setPhiValues();
+  simplifyConditions();
   simplifyAffectedPhis();
   rebuildSSA();
 
@@ -1083,6 +1174,7 @@ bool StructurizeCFG::run(Region *R, DominatorTree *DT) {
   Loops.clear();
   LoopPreds.clear();
   LoopConds.clear();
+  FlowSet.clear();
 
   return true;
 }

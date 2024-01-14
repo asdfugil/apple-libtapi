@@ -133,7 +133,8 @@ Pass *createIndVarSimplifyPass();
 //
 Pass *createLICMPass();
 Pass *createLICMPass(unsigned LicmMssaOptCap,
-                     unsigned LicmMssaNoAccForPromotionCap);
+                     unsigned LicmMssaNoAccForPromotionCap,
+                     bool AllowSpeculation);
 
 //===----------------------------------------------------------------------===//
 //
@@ -170,13 +171,6 @@ Pass *createLoopStrengthReducePass();
 
 //===----------------------------------------------------------------------===//
 //
-// LoopUnswitch - This pass is a simple loop unswitching pass.
-//
-Pass *createLoopUnswitchPass(bool OptimizeForSize = false,
-                             bool hasBranchDivergence = false);
-
-//===----------------------------------------------------------------------===//
-//
 // LoopInstSimplify - This pass simplifies instructions in a loop's body.
 //
 Pass *createLoopInstSimplifyPass();
@@ -190,7 +184,8 @@ Pass *createLoopUnrollPass(int OptLevel = 2, bool OnlyWhenForced = false,
                            int Count = -1, int AllowPartial = -1,
                            int Runtime = -1, int UpperBound = -1,
                            int AllowPeeling = -1);
-// Create an unrolling pass for full unrolling that uses exact trip count only.
+// Create an unrolling pass for full unrolling that uses exact trip count only
+// and also does peeling.
 Pass *createSimpleLoopUnrollPass(int OptLevel = 2, bool OnlyWhenForced = false,
                                  bool ForgetAllSCEV = false);
 
@@ -245,12 +240,18 @@ FunctionPass *createReassociatePass();
 //===----------------------------------------------------------------------===//
 //
 // JumpThreading - Thread control through mult-pred/multi-succ blocks where some
-// preds always go to some succ. If FreezeSelectCond is true, unfold the
-// condition of a select that unfolds to branch. Thresholds other than minus one
+// preds always go to some succ. Thresholds other than minus one
 // override the internal BB duplication default threshold.
 //
-FunctionPass *createJumpThreadingPass(bool FreezeSelectCond = false,
-                                      int Threshold = -1);
+FunctionPass *createJumpThreadingPass(int Threshold = -1);
+
+//===----------------------------------------------------------------------===//
+//
+// DFAJumpThreading - When a switch statement inside a loop is used to
+// implement a deterministic finite automata we can jump thread the switch
+// statement reducing number of conditional jumps.
+//
+FunctionPass *createDFAJumpThreadingPass();
 
 //===----------------------------------------------------------------------===//
 //
@@ -419,6 +420,12 @@ FunctionPass *createLowerExpectIntrinsicPass();
 
 //===----------------------------------------------------------------------===//
 //
+// TLSVariableHoist - This pass reduce duplicated TLS address call.
+//
+FunctionPass *createTLSVariableHoistPass();
+
+//===----------------------------------------------------------------------===//
+//
 // LowerConstantIntrinsicss - Expand any remaining llvm.objectsize and
 // llvm.is.constant intrinsic calls, even for the unknown cases.
 //
@@ -454,16 +461,6 @@ FunctionPass *createSpeculativeExecutionIfHasBranchDivergencePass();
 // instruction patterns in straight-line code.
 //
 FunctionPass *createStraightLineStrengthReducePass();
-
-//===----------------------------------------------------------------------===//
-//
-// PlaceSafepoints - Rewrite any IR calls to gc.statepoints and insert any
-// safepoint polls (method entry, backedge) that might be required.  This pass
-// does not generate explicit relocation sequences - that's handled by
-// RewriteStatepointsForGC which can be run at an arbitrary point in the pass
-// order following this pass.
-//
-FunctionPass *createPlaceSafepointsPass();
 
 //===----------------------------------------------------------------------===//
 //
@@ -513,10 +510,6 @@ FunctionPass *createLoopVersioningPass();
 // LoopDataPrefetch - Perform data prefetching in loops.
 //
 FunctionPass *createLoopDataPrefetchPass();
-
-///===---------------------------------------------------------------------===//
-ModulePass *createNameAnonGlobalPass();
-ModulePass *createCanonicalizeAliasesPass();
 
 //===----------------------------------------------------------------------===//
 //

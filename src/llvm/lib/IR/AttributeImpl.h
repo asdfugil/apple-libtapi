@@ -64,6 +64,7 @@ public:
 
   Attribute::AttrKind getKindAsEnum() const;
   uint64_t getValueAsInt() const;
+  bool getValueAsBool() const;
 
   StringRef getKindAsString() const;
   StringRef getValueAsString() const;
@@ -75,7 +76,7 @@ public:
 
   void Profile(FoldingSetNodeID &ID) const {
     if (isEnumAttribute())
-      Profile(ID, getKindAsEnum(), static_cast<uint64_t>(0));
+      Profile(ID, getKindAsEnum());
     else if (isIntAttribute())
       Profile(ID, getKindAsEnum(), getValueAsInt());
     else if (isStringAttribute())
@@ -84,10 +85,16 @@ public:
       Profile(ID, getKindAsEnum(), getValueAsType());
   }
 
+  static void Profile(FoldingSetNodeID &ID, Attribute::AttrKind Kind) {
+    assert(Attribute::isEnumAttrKind(Kind) && "Expected enum attribute");
+    ID.AddInteger(Kind);
+  }
+
   static void Profile(FoldingSetNodeID &ID, Attribute::AttrKind Kind,
                       uint64_t Val) {
+    assert(Attribute::isIntAttrKind(Kind) && "Expected int attribute");
     ID.AddInteger(Kind);
-    if (Val) ID.AddInteger(Val);
+    ID.AddInteger(Val);
   }
 
   static void Profile(FoldingSetNodeID &ID, StringRef Kind, StringRef Values) {
@@ -135,7 +142,7 @@ class IntAttributeImpl : public EnumAttributeImpl {
 public:
   IntAttributeImpl(Attribute::AttrKind Kind, uint64_t Val)
       : EnumAttributeImpl(IntAttrEntry, Kind), Val(Val) {
-    assert(Attribute::doesAttrKindHaveArgument(Kind) &&
+    assert(Attribute::isIntAttrKind(Kind) &&
            "Wrong kind for int attribute!");
   }
 
@@ -251,12 +258,13 @@ public:
   MaybeAlign getStackAlignment() const;
   uint64_t getDereferenceableBytes() const;
   uint64_t getDereferenceableOrNullBytes() const;
-  std::pair<unsigned, Optional<unsigned>> getAllocSizeArgs() const;
+  Optional<std::pair<unsigned, Optional<unsigned>>> getAllocSizeArgs() const;
+  unsigned getVScaleRangeMin() const;
+  Optional<unsigned> getVScaleRangeMax() const;
+  UWTableKind getUWTableKind() const;
+  AllocFnKind getAllocKind() const;
   std::string getAsString(bool InAttrGrp) const;
-  Type *getByValType() const;
-  Type *getStructRetType() const;
-  Type *getByRefType() const;
-  Type *getPreallocatedType() const;
+  Type *getAttributeType(Attribute::AttrKind Kind) const;
 
   using iterator = const Attribute *;
 
