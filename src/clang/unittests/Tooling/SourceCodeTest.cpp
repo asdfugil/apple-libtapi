@@ -247,15 +247,26 @@ TEST(SourceCodeTest, getAssociatedRange) {
 
   // Includes attributes.
   Visitor.runOverAnnotated(R"cpp(
-      #define ATTR __attribute__((deprecated("message")))
-      $r[[ATTR
+      $r[[__attribute__((deprecated("message")))
       int x;]])cpp");
 
   // Includes attributes and comments together.
   Visitor.runOverAnnotated(R"cpp(
-      #define ATTR __attribute__((deprecated("message")))
-      $r[[ATTR
-      // Commment.
+      $r[[__attribute__((deprecated("message")))
+      // Comment.
+      int x;]])cpp");
+
+  // Includes attributes through macro expansion.
+  Visitor.runOverAnnotated(R"cpp(
+      #define MACRO_EXPANSION __attribute__((deprecated("message")))
+      $r[[MACRO_EXPANSION
+      int x;]])cpp");
+
+  // Includes attributes through macro expansion with comments.
+  Visitor.runOverAnnotated(R"cpp(
+      #define MACRO_EXPANSION __attribute__((deprecated("message")))
+      $r[[MACRO_EXPANSION
+      // Comment.
       int x;]])cpp");
 }
 
@@ -402,15 +413,26 @@ TEST(SourceCodeTest, getAssociatedRangeWithComments) {
 
   // Includes attributes.
   Visit(R"cpp(
-      #define ATTR __attribute__((deprecated("message")))
-      $r[[ATTR
+      $r[[__attribute__((deprecated("message")))
       int x;]])cpp");
 
   // Includes attributes and comments together.
   Visit(R"cpp(
-      #define ATTR __attribute__((deprecated("message")))
-      $r[[ATTR
-      // Commment.
+      $r[[__attribute__((deprecated("message")))
+      // Comment.
+      int x;]])cpp");
+
+  // Includes attributes through macro expansion.
+  Visitor.runOverAnnotated(R"cpp(
+      #define MACRO_EXPANSION __attribute__((deprecated("message")))
+      $r[[MACRO_EXPANSION
+      int x;]])cpp");
+
+  // Includes attributes through macro expansion with comments.
+  Visitor.runOverAnnotated(R"cpp(
+      #define MACRO_EXPANSION __attribute__((deprecated("message")))
+      $r[[MACRO_EXPANSION
+      // Comment.
       int x;]])cpp");
 }
 
@@ -474,7 +496,7 @@ int c = BAR 3.0;
   IntLitVisitor Visitor;
   Visitor.OnIntLit = [](IntegerLiteral *Expr, ASTContext *Context) {
     auto Range = CharSourceRange::getTokenRange(Expr->getSourceRange());
-    EXPECT_FALSE(getRangeForEdit(Range, *Context).hasValue());
+    EXPECT_FALSE(getRangeForEdit(Range, *Context));
   };
   Visitor.runOver(Code);
 }
@@ -621,4 +643,71 @@ int c = BAR 3.0;
   };
   Visitor.runOver(Code);
 }
+
+TEST(SourceCodeTest, GetCallReturnType_Dependent) {
+  llvm::Annotations Code{R"cpp(
+template<class T, class F>
+void templ(const T& t, F f) {}
+
+template<class T, class F>
+void templ1(const T& t, F f) {
+  $test1[[f(t)]];
+}
+
+int f_overload(int) { return 1; }
+int f_overload(double) { return 2; }
+
+void f1() {
+  int i = 0;
+  templ(i, [](const auto &p) {
+    $test2[[f_overload(p)]];
+  });
+}
+
+struct A {
+  void f_overload(int);
+  void f_overload(double);
+};
+
+void f2() {
+ int i = 0;
+ templ(i, [](const auto &p) {
+   A a;
+   $test3[[a.f_overload(p)]];
+ });
+}
+)cpp"};
+
+  llvm::Annotations::Range R1 = Code.range("test1");
+  llvm::Annotations::Range R2 = Code.range("test2");
+  llvm::Annotations::Range R3 = Code.range("test3");
+
+  CallsVisitor Visitor;
+  Visitor.OnCall = [&R1, &R2, &R3](CallExpr *Expr, ASTContext *Context) {
+    unsigned Begin = Context->getSourceManager().getFileOffset(
+        Expr->getSourceRange().getBegin());
+    unsigned End = Context->getSourceManager().getFileOffset(
+        Expr->getSourceRange().getEnd());
+    llvm::Annotations::Range R{Begin, End + 1};
+
+    QualType CalleeType = Expr->getCallee()->getType();
+    if (R == R1) {
+      ASSERT_TRUE(CalleeType->isDependentType());
+      EXPECT_EQ(Expr->getCallReturnType(*Context), Context->DependentTy);
+    } else if (R == R2) {
+      ASSERT_FALSE(CalleeType->isDependentType());
+      ASSERT_TRUE(CalleeType->isSpecificPlaceholderType(BuiltinType::Overload));
+      ASSERT_TRUE(isa<UnresolvedLookupExpr>(Expr->getCallee()));
+      EXPECT_EQ(Expr->getCallReturnType(*Context), Context->DependentTy);
+    } else if (R == R3) {
+      ASSERT_FALSE(CalleeType->isDependentType());
+      ASSERT_TRUE(
+          CalleeType->isSpecificPlaceholderType(BuiltinType::BoundMember));
+      ASSERT_TRUE(isa<UnresolvedMemberExpr>(Expr->getCallee()));
+      EXPECT_EQ(Expr->getCallReturnType(*Context), Context->DependentTy);
+    }
+  };
+  Visitor.runOver(Code.code(), CallsVisitor::Lang_CXX14);
+}
+
 } // end anonymous namespace

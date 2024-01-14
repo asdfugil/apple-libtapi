@@ -10,6 +10,7 @@
 #define LLVM_CLANG_DRIVER_JOB_H
 
 #include "clang/Basic/LLVM.h"
+#include "clang/Driver/InputInfo.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallVector.h"
@@ -121,8 +122,8 @@ class Command {
   /// argument, which will be the executable).
   llvm::opt::ArgStringList Arguments;
 
-  /// The list of program arguments which are inputs.
-  llvm::opt::ArgStringList InputFilenames;
+  /// The list of program inputs.
+  std::vector<InputInfo> InputInfoList;
 
   /// The list of program arguments which are outputs. May be empty.
   std::vector<std::string> OutputFilenames;
@@ -141,6 +142,10 @@ class Command {
 
   /// See Command::setEnvironment
   std::vector<const char *> Environment;
+  std::vector<const char *> EnvironmentDisplay;
+
+  /// Optional redirection for stdin, stdout, stderr.
+  std::vector<Optional<std::string>> RedirectFiles;
 
   /// Information on executable run provided by OS.
   mutable Optional<llvm::sys::ProcessStatistics> ProcStat;
@@ -205,13 +210,22 @@ public:
   ///         from the parent process will be used.
   virtual void setEnvironment(llvm::ArrayRef<const char *> NewEnvironment);
 
+  void setRedirectFiles(const std::vector<Optional<std::string>> &Redirects);
+
+  void replaceArguments(llvm::opt::ArgStringList List) {
+    Arguments = std::move(List);
+  }
+
+  /// Sets the environment to display in `-###`.
+  virtual void setEnvironmentDisplay(llvm::ArrayRef<const char *> Display);
+
+  void replaceExecutable(const char *Exe) { Executable = Exe; }
+
   const char *getExecutable() const { return Executable; }
 
   const llvm::opt::ArgStringList &getArguments() const { return Arguments; }
 
-  const llvm::opt::ArgStringList &getInputFilenames() const {
-    return InputFilenames;
-  }
+  const std::vector<InputInfo> &getInputInfos() const { return InputInfoList; }
 
   const std::vector<std::string> &getOutputFilenames() const {
     return OutputFilenames;
@@ -243,15 +257,13 @@ public:
   void setEnvironment(llvm::ArrayRef<const char *> NewEnvironment) override;
 };
 
-/// Like Command, but with a fallback which is executed in case
-/// the primary command crashes.
-class FallbackCommand : public Command {
+/// Automatically cache -cc1 commands when possible.
+class CachingCC1Command : public CC1Command {
 public:
-  FallbackCommand(const Action &Source_, const Tool &Creator_,
-                  ResponseFileSupport ResponseSupport, const char *Executable_,
-                  const llvm::opt::ArgStringList &Arguments_,
-                  ArrayRef<InputInfo> Inputs, ArrayRef<InputInfo> Outputs,
-                  std::unique_ptr<Command> Fallback_);
+  CachingCC1Command(const Action &Source, const Tool &Creator,
+             ResponseFileSupport ResponseSupport, const char *Executable,
+             const llvm::opt::ArgStringList &Arguments,
+             ArrayRef<InputInfo> Inputs, ArrayRef<InputInfo> Outputs = None);
 
   void Print(llvm::raw_ostream &OS, const char *Terminator, bool Quote,
              CrashReportInfo *CrashInfo = nullptr) const override;
@@ -259,8 +271,7 @@ public:
   int Execute(ArrayRef<Optional<StringRef>> Redirects, std::string *ErrMsg,
               bool *ExecutionFailed) const override;
 
-private:
-  std::unique_ptr<Command> Fallback;
+  void setEnvironment(llvm::ArrayRef<const char *> NewEnvironment) override;
 };
 
 /// Like Command, but always pretends that the wrapped command succeeded.

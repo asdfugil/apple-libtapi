@@ -127,15 +127,20 @@ struct CGRecordLowering {
 
   /// Wraps llvm::Type::getIntNTy with some implicit arguments.
   llvm::Type *getIntNType(uint64_t NumBits) {
-    return llvm::Type::getIntNTy(Types.getLLVMContext(),
-                                 (unsigned)llvm::alignTo(NumBits, 8));
+    unsigned AlignedBits = llvm::alignTo(NumBits, Context.getCharWidth());
+    return llvm::Type::getIntNTy(Types.getLLVMContext(), AlignedBits);
   }
-  /// Gets an llvm type of size NumBytes and alignment 1.
-  llvm::Type *getByteArrayType(CharUnits NumBytes) {
-    assert(!NumBytes.isZero() && "Empty byte arrays aren't allowed.");
-    llvm::Type *Type = llvm::Type::getInt8Ty(Types.getLLVMContext());
-    return NumBytes == CharUnits::One() ? Type :
-        (llvm::Type *)llvm::ArrayType::get(Type, NumBytes.getQuantity());
+  /// Get the LLVM type sized as one character unit.
+  llvm::Type *getCharType() {
+    return llvm::Type::getIntNTy(Types.getLLVMContext(),
+                                 Context.getCharWidth());
+  }
+  /// Gets an llvm type of size NumChars and alignment 1.
+  llvm::Type *getByteArrayType(CharUnits NumChars) {
+    assert(!NumChars.isZero() && "Empty byte arrays aren't allowed.");
+    llvm::Type *Type = getCharType();
+    return NumChars == CharUnits::One() ? Type :
+        (llvm::Type *)llvm::ArrayType::get(Type, NumChars.getQuantity());
   }
   /// Gets the storage type for a field decl and handles storage
   /// for itanium bitfields that are smaller than their declared type.
@@ -406,7 +411,7 @@ CGRecordLowering::accumulateBitFields(RecordDecl::field_iterator Field,
         continue;
       }
       llvm::Type *Type =
-          Types.ConvertTypeForMem(Field->getType(), /*ForBitFields=*/true);
+          Types.ConvertTypeForMem(Field->getType(), /*ForBitField=*/true);
       // If we don't have a run yet, or don't live within the previous run's
       // allocated storage then we allocate some storage and start a new run.
       if (Run == FieldEnd || BitOffset >= Tail) {

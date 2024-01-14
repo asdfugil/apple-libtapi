@@ -40,7 +40,6 @@ class ClassTemplateSpecializationDecl;
 class GlobalDecl;
 class ModuleMap;
 class ObjCInterfaceDecl;
-class ObjCIvarDecl;
 class UsingDecl;
 class VarDecl;
 enum class DynamicInitKind : unsigned;
@@ -153,13 +152,24 @@ class CGDebugInfo {
   llvm::DenseMap<const char *, llvm::TrackingMDRef> DIFileCache;
   llvm::DenseMap<const FunctionDecl *, llvm::TrackingMDRef> SPCache;
   /// Cache declarations relevant to DW_TAG_imported_declarations (C++
-  /// using declarations) that aren't covered by other more specific caches.
+  /// using declarations and global alias variables) that aren't covered
+  /// by other more specific caches.
   llvm::DenseMap<const Decl *, llvm::TrackingMDRef> DeclCache;
+  llvm::DenseMap<const Decl *, llvm::TrackingMDRef> ImportedDeclCache;
   llvm::DenseMap<const NamespaceDecl *, llvm::TrackingMDRef> NamespaceCache;
   llvm::DenseMap<const NamespaceAliasDecl *, llvm::TrackingMDRef>
       NamespaceAliasCache;
   llvm::DenseMap<const Decl *, llvm::TypedTrackingMDRef<llvm::DIDerivedType>>
       StaticDataMemberCache;
+
+  using ParamDecl2StmtTy = llvm::DenseMap<const ParmVarDecl *, const Stmt *>;
+  using Param2DILocTy =
+      llvm::DenseMap<const ParmVarDecl *, llvm::DILocalVariable *>;
+
+  /// The key is coroutine real parameters, value is coroutine move parameters.
+  ParamDecl2StmtTy CoroutineParameterMappings;
+  /// The key is coroutine real parameters, value is DIVariable in LLVM IR.
+  Param2DILocTy ParamDbgMappings;
 
   /// Helper functions for getOrCreateType.
   /// @{
@@ -167,9 +177,10 @@ class CGDebugInfo {
   /// ivars and property accessors.
   llvm::DIType *CreateType(const BuiltinType *Ty);
   llvm::DIType *CreateType(const ComplexType *Ty);
-  llvm::DIType *CreateType(const AutoType *Ty);
-  llvm::DIType *CreateType(const ExtIntType *Ty);
+  llvm::DIType *CreateType(const BitIntType *Ty);
   llvm::DIType *CreateQualifiedType(QualType Ty, llvm::DIFile *Fg);
+  llvm::DIType *CreateQualifiedType(const FunctionProtoType *Ty,
+                                    llvm::DIFile *Fg);
   llvm::DIType *CreateType(const TypedefType *Ty, llvm::DIFile *Fg);
   llvm::DIType *CreateType(const TemplateSpecializationType *Ty,
                            llvm::DIFile *Fg);
@@ -179,7 +190,15 @@ class CGDebugInfo {
   llvm::DIType *CreateType(const FunctionType *Ty, llvm::DIFile *F);
   /// Get structure or union type.
   llvm::DIType *CreateType(const RecordType *Tyg);
-  llvm::DIType *CreateTypeDefinition(const RecordType *Ty);
+
+  /// Create definition for the specified 'Ty'.
+  ///
+  /// \returns A pair of 'llvm::DIType's. The first is the definition
+  /// of the 'Ty'. The second is the type specified by the preferred_name
+  /// attribute on 'Ty', which can be a nullptr if no such attribute
+  /// exists.
+  std::pair<llvm::DIType *, llvm::DIType *>
+  CreateTypeDefinition(const RecordType *Ty);
   llvm::DICompositeType *CreateLimitedType(const RecordType *Ty);
   void CollectContainingType(const CXXRecordDecl *RD,
                              llvm::DICompositeType *CT);
@@ -219,10 +238,10 @@ class CGDebugInfo {
   /// not updated to include implicit \c this pointer. Use this routine
   /// to get a method type which includes \c this pointer.
   llvm::DISubroutineType *getOrCreateMethodType(const CXXMethodDecl *Method,
-                                                llvm::DIFile *F, bool decl);
+                                                llvm::DIFile *F);
   llvm::DISubroutineType *
   getOrCreateInstanceMethodType(QualType ThisPtr, const FunctionProtoType *Func,
-                                llvm::DIFile *Unit, bool decl);
+                                llvm::DIFile *Unit);
   llvm::DISubroutineType *
   getOrCreateFunctionType(const Decl *D, QualType FnType, llvm::DIFile *F);
   /// \return debug info descriptor for vtable.
@@ -263,9 +282,18 @@ class CGDebugInfo {
       llvm::DenseSet<CanonicalDeclPtr<const CXXRecordDecl>> &SeenTypes,
       llvm::DINode::DIFlags StartingFlags);
 
+  /// Helper function that returns the llvm::DIType that the
+  /// PreferredNameAttr attribute on \ref RD refers to. If no such
+  /// attribute exists, returns nullptr.
+  llvm::DIType *GetPreferredNameType(const CXXRecordDecl *RD,
+                                     llvm::DIFile *Unit);
+
+  struct TemplateArgs {
+    const TemplateParameterList *TList;
+    llvm::ArrayRef<TemplateArgument> Args;
+  };
   /// A helper function to collect template parameters.
-  llvm::DINodeArray CollectTemplateParams(const TemplateParameterList *TPList,
-                                          ArrayRef<TemplateArgument> TAList,
+  llvm::DINodeArray CollectTemplateParams(Optional<TemplateArgs> Args,
                                           llvm::DIFile *Unit);
   /// A helper function to collect debug info for function template
   /// parameters.
@@ -277,17 +305,24 @@ class CGDebugInfo {
   llvm::DINodeArray CollectVarTemplateParams(const VarDecl *VD,
                                              llvm::DIFile *Unit);
 
+  Optional<TemplateArgs> GetTemplateArgs(const VarDecl *) const;
+  Optional<TemplateArgs> GetTemplateArgs(const RecordDecl *) const;
+  Optional<TemplateArgs> GetTemplateArgs(const FunctionDecl *) const;
+
   /// A helper function to collect debug info for template
   /// parameters.
-  llvm::DINodeArray
-  CollectCXXTemplateParams(const ClassTemplateSpecializationDecl *TS,
-                           llvm::DIFile *F);
+  llvm::DINodeArray CollectCXXTemplateParams(const RecordDecl *TS,
+                                             llvm::DIFile *F);
+
+  /// A helper function to collect debug info for btf_decl_tag annotations.
+  llvm::DINodeArray CollectBTFDeclTagAnnotations(const Decl *D);
 
   llvm::DIType *createFieldType(StringRef name, QualType type,
                                 SourceLocation loc, AccessSpecifier AS,
                                 uint64_t offsetInBits, uint32_t AlignInBits,
                                 llvm::DIFile *tunit, llvm::DIScope *scope,
-                                const RecordDecl *RD = nullptr);
+                                const RecordDecl *RD = nullptr,
+                                llvm::DINodeArray Annotations = nullptr);
 
   llvm::DIType *createFieldType(StringRef name, QualType type,
                                 SourceLocation loc, AccessSpecifier AS,
@@ -324,8 +359,7 @@ class CGDebugInfo {
   /// If the C++ class has vtable info then insert appropriate debug
   /// info entry in EltTys vector.
   void CollectVTableInfo(const CXXRecordDecl *Decl, llvm::DIFile *F,
-                         SmallVectorImpl<llvm::Metadata *> &EltTys,
-                         llvm::DICompositeType *RecordTy);
+                         SmallVectorImpl<llvm::Metadata *> &EltTys);
   /// @}
 
   /// Create a new lexical block node and push it on the stack.
@@ -338,7 +372,7 @@ class CGDebugInfo {
   /// Extended dereferencing mechanism is has the following format:
   ///     DW_OP_constu <DWARF Address Space> DW_OP_swap DW_OP_xderef
   void AppendAddressSpaceXDeref(unsigned AddressSpace,
-                                SmallVectorImpl<int64_t> &Expr) const;
+                                SmallVectorImpl<uint64_t> &Expr) const;
 
   /// A helper function to collect debug info for the default elements of a
   /// block.
@@ -409,14 +443,16 @@ public:
   /// location will be reused.
   void EmitLocation(CGBuilderTy &Builder, SourceLocation Loc);
 
+  QualType getFunctionType(const FunctionDecl *FD, QualType RetTy,
+                           const SmallVectorImpl<const VarDecl *> &Args);
+
   /// Emit a call to llvm.dbg.function.start to indicate
   /// start of a new function.
   /// \param Loc       The location of the function header.
   /// \param ScopeLoc  The location of the function body.
-  void EmitFunctionStart(GlobalDecl GD, SourceLocation Loc,
+  void emitFunctionStart(GlobalDecl GD, SourceLocation Loc,
                          SourceLocation ScopeLoc, QualType FnType,
-                         llvm::Function *Fn, bool CurFnIsThunk,
-                         CGBuilderTy &Builder);
+                         llvm::Function *Fn, bool CurFnIsThunk);
 
   /// Start a new scope for an inlined function.
   void EmitInlineFunctionStart(CGBuilderTy &Builder, GlobalDecl GD);
@@ -465,8 +501,9 @@ public:
 
   /// Emit call to \c llvm.dbg.declare for an argument variable
   /// declaration.
-  void EmitDeclareOfArgVariable(const VarDecl *Decl, llvm::Value *AI,
-                                unsigned ArgNo, CGBuilderTy &Builder);
+  llvm::DILocalVariable *
+  EmitDeclareOfArgVariable(const VarDecl *Decl, llvm::Value *AI, unsigned ArgNo,
+                           CGBuilderTy &Builder, bool UsePointerValue = false);
 
   /// Emit call to \c llvm.dbg.declare for the block-literal argument
   /// to a block invocation function.
@@ -484,6 +521,9 @@ public:
   /// Emit information about an external variable.
   void EmitExternalVariable(llvm::GlobalVariable *GV, const VarDecl *Decl);
 
+  /// Emit information about global variable alias.
+  void EmitGlobalAlias(const llvm::GlobalValue *GV, const GlobalDecl Decl);
+
   /// Emit C++ using directive.
   void EmitUsingDirective(const UsingDirectiveDecl &UD);
 
@@ -493,11 +533,25 @@ public:
   /// Emit the type even if it might not be used.
   void EmitAndRetainType(QualType Ty);
 
+  /// Emit a shadow decl brought in by a using or using-enum
+  void EmitUsingShadowDecl(const UsingShadowDecl &USD);
+
   /// Emit C++ using declaration.
   void EmitUsingDecl(const UsingDecl &UD);
 
+  /// Emit C++ using-enum declaration.
+  void EmitUsingEnumDecl(const UsingEnumDecl &UD);
+
   /// Emit an @import declaration.
   void EmitImportDecl(const ImportDecl &ID);
+
+  /// DebugInfo isn't attached to string literals by default. While certain
+  /// aspects of debuginfo aren't useful for string literals (like a name), it's
+  /// nice to be able to symbolize the line and column information. This is
+  /// especially useful for sanitizers, as it allows symbolization of
+  /// heap-buffer-overflows on constant strings.
+  void AddStringLiteralDebugInfo(llvm::GlobalVariable *GV,
+                                 const StringLiteral *S);
 
   /// Emit C++ namespace alias.
   llvm::DIImportedEntity *EmitNamespaceAlias(const NamespaceAliasDecl &NA);
@@ -535,11 +589,24 @@ public:
                                          SourceLocation LineLoc,
                                          SourceLocation FileLoc);
 
+  Param2DILocTy &getParamDbgMappings() { return ParamDbgMappings; }
+  ParamDecl2StmtTy &getCoroutineParameterMappings() {
+    return CoroutineParameterMappings;
+  }
+
 private:
   /// Emit call to llvm.dbg.declare for a variable declaration.
   /// Returns a pointer to the DILocalVariable associated with the
   /// llvm.dbg.declare, or nullptr otherwise.
   llvm::DILocalVariable *EmitDeclare(const VarDecl *decl, llvm::Value *AI,
+                                     llvm::Optional<unsigned> ArgNo,
+                                     CGBuilderTy &Builder,
+                                     const bool UsePointerValue = false);
+
+  /// Emit call to llvm.dbg.declare for a binding declaration.
+  /// Returns a pointer to the DILocalVariable associated with the
+  /// llvm.dbg.declare, or nullptr otherwise.
+  llvm::DILocalVariable *EmitDeclare(const BindingDecl *decl, llvm::Value *AI,
                                      llvm::Optional<unsigned> ArgNo,
                                      CGBuilderTy &Builder,
                                      const bool UsePointerValue = false);
@@ -550,6 +617,8 @@ private:
     /// The type as it appears in the source code.
     llvm::DIType *WrappedType;
   };
+
+  std::string GetName(const Decl*, bool Qualified = false) const;
 
   /// Build up structure info for the byref.  See \a BuildByRefType.
   BlockByRefType EmitTypeForVarWithBlocksAttr(const VarDecl *VD,
@@ -575,7 +644,7 @@ private:
 
   /// Compute the file checksum debug info for input file ID.
   Optional<llvm::DIFile::ChecksumKind>
-  computeChecksum(FileID FID, SmallString<32> &Checksum) const;
+  computeChecksum(FileID FID, SmallString<64> &Checksum) const;
 
   /// Get the source of the given file ID.
   Optional<StringRef> getSource(const SourceManager &SM, FileID FID);
@@ -603,8 +672,7 @@ private:
 
   /// Get the type from the cache or create a new partial type if
   /// necessary.
-  llvm::DICompositeType *getOrCreateLimitedType(const RecordType *Ty,
-                                                llvm::DIFile *F);
+  llvm::DICompositeType *getOrCreateLimitedType(const RecordType *Ty);
 
   /// Create type metadata for a source language type.
   llvm::DIType *CreateTypeNode(QualType Ty, llvm::DIFile *Fg);

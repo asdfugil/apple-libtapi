@@ -21,7 +21,11 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/CAS/CASID.h"
+#include "llvm/CAS/CASOutputBackend.h"
 #include "llvm/Support/BuryPointer.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/VirtualOutputBackend.h"
 #include <cassert>
 #include <list>
 #include <memory>
@@ -40,8 +44,6 @@ class ASTReader;
 class CodeCompleteConsumer;
 class DiagnosticsEngine;
 class DiagnosticConsumer;
-class ExternalASTSource;
-class FileEntry;
 class FileManager;
 class FrontendAction;
 class InMemoryModuleCache;
@@ -83,8 +85,20 @@ class CompilerInstance : public ModuleLoader {
   /// Auxiliary Target info.
   IntrusiveRefCntPtr<TargetInfo> AuxTarget;
 
+  /// The CAS, if any.
+  std::shared_ptr<llvm::cas::ObjectStore> CAS;
+
+  /// The ActionCache, if any.
+  std::shared_ptr<llvm::cas::ActionCache> ActionCache;
+
+  /// The \c ActionCache key for this compilation, if caching is enabled.
+  Optional<cas::CASID> CompileJobCacheKey;
+
   /// The file manager.
   IntrusiveRefCntPtr<FileManager> FileMgr;
+
+  /// The output context.
+  IntrusiveRefCntPtr<llvm::vfs::OutputBackend> TheOutputBackend;
 
   /// The source manager.
   IntrusiveRefCntPtr<SourceManager> SourceMgr;
@@ -150,7 +164,7 @@ class CompilerInstance : public ModuleLoader {
   bool HaveFullGlobalModuleIndex = false;
 
   /// One or more modules failed to build.
-  bool ModuleBuildFailed = false;
+  bool DisableGeneratingGlobalModuleIndex = false;
 
   /// The stream for verbose output if owned, otherwise nullptr.
   std::unique_ptr<raw_ostream> OwnedVerboseOutputStream;
@@ -158,36 +172,21 @@ class CompilerInstance : public ModuleLoader {
   /// The stream for verbose output.
   raw_ostream *VerboseOutputStream = &llvm::errs();
 
-  /// Holds information about the output file.
-  ///
-  /// If TempFilename is not empty we must rename it to Filename at the end.
-  /// TempFilename may be empty and Filename non-empty if creating the temporary
-  /// failed.
-  struct OutputFile {
-    std::string Filename;
-    std::string TempFilename;
-
-    OutputFile(std::string filename, std::string tempFilename)
-        : Filename(std::move(filename)), TempFilename(std::move(tempFilename)) {
-    }
-  };
-
-  /// If the output doesn't support seeking (terminal, pipe). we switch
-  /// the stream to a buffer_ostream. These are the buffer and the original
-  /// stream.
-  std::unique_ptr<llvm::raw_fd_ostream> NonSeekStream;
-
   /// The list of active output files.
-  std::list<OutputFile> OutputFiles;
+  std::list<llvm::vfs::OutputFile> OutputFiles;
 
-  /// \brief An optional callback function used to wrap all FrontendActions
+  using GenModuleActionWrapperFunc =
+      std::function<std::unique_ptr<FrontendAction>(
+          const FrontendOptions &opts, std::unique_ptr<FrontendAction> action)>;
+
+  /// An optional callback function used to wrap all FrontendActions
   /// produced to generate imported modules before they are executed.
-  std::function<std::unique_ptr<FrontendAction>
-    (const FrontendOptions &opts, std::unique_ptr<FrontendAction> action)>
-    GenModuleActionWrapper;
+  GenModuleActionWrapperFunc GenModuleActionWrapper;
 
   /// Force an output buffer.
   std::unique_ptr<llvm::raw_pwrite_stream> OutputStream;
+
+  void createCASDatabases();
 
   CompilerInstance(const CompilerInstance &) = delete;
   void operator=(const CompilerInstance &) = delete;
@@ -229,6 +228,12 @@ public:
   // FIXME: Eliminate the llvm_shutdown requirement, that should either be part
   // of the context or else not CompilerInstance specific.
   bool ExecuteAction(FrontendAction &Act);
+
+  /// At the end of a compilation, print the number of warnings/errors.
+  void printDiagnosticStats();
+
+  /// Load the list of plugins requested in the \c FrontendOptions.
+  void LoadRequestedPlugins();
 
   /// }
   /// @name Compiler Invocation and Options
@@ -341,6 +346,22 @@ public:
     return Invocation->getTargetOpts();
   }
 
+  CASOptions &getCASOpts() {
+    return Invocation->getCASOpts();
+  }
+  const CASOptions &getCASOpts() const {
+    return Invocation->getCASOpts();
+  }
+
+  Optional<cas::CASID> getCompileJobCacheKey() const {
+    return CompileJobCacheKey;
+  }
+  void setCompileJobCacheKey(cas::CASID Key) {
+    assert(!CompileJobCacheKey || CompileJobCacheKey == Key);
+    CompileJobCacheKey = std::move(Key);
+  }
+  bool isSourceNonReproducible() const;
+
   /// }
   /// @name Diagnostics Engine
   /// {
@@ -400,6 +421,9 @@ public:
   /// Replace the current AuxTarget.
   void setAuxTarget(TargetInfo *Value);
 
+  // Create Target and AuxTarget based on current options
+  bool createTarget();
+
   /// }
   /// @name Virtual File System
   /// {
@@ -425,6 +449,21 @@ public:
 
   /// Replace the current file manager and virtual file system.
   void setFileManager(FileManager *Value);
+
+  /// Set the output manager.
+  void setOutputBackend(IntrusiveRefCntPtr<llvm::vfs::OutputBackend> NewOutputs);
+
+  /// Create an output manager.
+  void createOutputBackend();
+
+  bool hasOutputBackend() const { return bool(TheOutputBackend); }
+
+  llvm::vfs::OutputBackend &getOutputBackend();
+  llvm::vfs::OutputBackend &getOrCreateOutputBackend();
+
+  /// Get the CAS, or create it using the configuration in CompilerInvocation.
+  llvm::cas::ObjectStore &getOrCreateObjectStore();
+  llvm::cas::ActionCache &getOrCreateActionCache();
 
   /// }
   /// @name Source Manager
@@ -596,11 +635,6 @@ public:
   /// @name Output Files
   /// {
 
-  /// addOutputFile - Add an output file onto the list of tracked output files.
-  ///
-  /// \param OutFile - The output file info.
-  void addOutputFile(OutputFile &&OutFile);
-
   /// clearOutputFiles - Clear the output file list. The underlying output
   /// streams must have been closed beforehand.
   ///
@@ -677,7 +711,8 @@ public:
   void createPCHExternalASTSource(
       StringRef Path, DisableValidationForModuleKind DisableValidation,
       bool AllowPCHWithCompilerErrors, void *DeserializationListener,
-      bool OwnDeserializationListener);
+      bool OwnDeserializationListener,
+      std::unique_ptr<llvm::MemoryBuffer> PCHBuffer = nullptr);
 
   /// Create an external AST source to read a PCH file.
   ///
@@ -691,7 +726,9 @@ public:
       ArrayRef<std::shared_ptr<ModuleFileExtension>> Extensions,
       ArrayRef<std::shared_ptr<DependencyCollector>> DependencyCollectors,
       void *DeserializationListener, bool OwnDeserializationListener,
-      bool Preamble, bool UseGlobalModuleIndex);
+      bool Preamble, bool UseGlobalModuleIndex,
+      cas::ObjectStore &CAS, cas::ActionCache &Cache,
+      std::unique_ptr<llvm::MemoryBuffer> PCHBuffer = nullptr);
 
   /// Create a code completion consumer using the invocation; note that this
   /// will cause the source manager to truncate the input source file at the
@@ -714,25 +751,27 @@ public:
   /// Create the default output file (from the invocation's options) and add it
   /// to the list of tracked output files.
   ///
-  /// The files created by this function always use temporary files to write to
-  /// their result (that is, the data is written to a temporary file which will
-  /// atomically replace the target output on success).
+  /// The files created by this are usually removed on signal, and, depending
+  /// on FrontendOptions, may also use a temporary file (that is, the data is
+  /// written to a temporary file which will atomically replace the target
+  /// output on success).
   ///
   /// \return - Null on error.
-  std::unique_ptr<raw_pwrite_stream>
-  createDefaultOutputFile(bool Binary = true, StringRef BaseInput = "",
-                          StringRef Extension = "");
+  std::unique_ptr<raw_pwrite_stream> createDefaultOutputFile(
+      bool Binary = true, StringRef BaseInput = "", StringRef Extension = "",
+      bool RemoveFileOnSignal = true, bool CreateMissingDirectories = false,
+      bool ForceUseTemporary = false);
 
-  /// Create a new output file and add it to the list of tracked output files,
-  /// optionally deriving the output path name.
+  /// Create a new output file, optionally deriving the output path name, and
+  /// add it to the list of tracked output files.
   ///
   /// \return - Null on error.
   std::unique_ptr<raw_pwrite_stream>
   createOutputFile(StringRef OutputPath, bool Binary, bool RemoveFileOnSignal,
-                   StringRef BaseInput, StringRef Extension, bool UseTemporary,
-                   bool CreateMissingDirectories = false);
+                   bool UseTemporary, bool CreateMissingDirectories = false);
 
-  /// Create a new output file, optionally deriving the output path name.
+private:
+  /// Create a new output file and add it to the list of tracked output files.
   ///
   /// If \p OutputPath is empty, then createOutputFile will derive an output
   /// path location as \p BaseInput, with any suffix removed, and \p Extension
@@ -741,10 +780,6 @@ public:
   /// renamed to \p OutputPath in the end.
   ///
   /// \param OutputPath - If given, the path to the output file.
-  /// \param Error [out] - On failure, the error.
-  /// \param BaseInput - If \p OutputPath is empty, the input path name to use
-  /// for deriving the output path.
-  /// \param Extension - The extension to use for derived output names.
   /// \param Binary - The mode to open the file in.
   /// \param RemoveFileOnSignal - Whether the file should be registered with
   /// llvm::sys::RemoveFileOnSignal. Note that this is not safe for
@@ -753,17 +788,12 @@ public:
   /// OutputPath in the end.
   /// \param CreateMissingDirectories - When \p UseTemporary is true, create
   /// missing directories in the output path.
-  /// \param ResultPathName [out] - If given, the result path name will be
-  /// stored here on success.
-  /// \param TempPathName [out] - If given, the temporary file path name
-  /// will be stored here on success.
-  std::unique_ptr<raw_pwrite_stream>
-  createOutputFile(StringRef OutputPath, std::error_code &Error, bool Binary,
-                   bool RemoveFileOnSignal, StringRef BaseInput,
-                   StringRef Extension, bool UseTemporary,
-                   bool CreateMissingDirectories, std::string *ResultPathName,
-                   std::string *TempPathName);
+  Expected<std::unique_ptr<raw_pwrite_stream>>
+  createOutputFileImpl(StringRef OutputPath, bool Binary,
+                       bool RemoveFileOnSignal, bool UseTemporary,
+                       bool CreateMissingDirectories);
 
+public:
   std::unique_ptr<raw_pwrite_stream> createNullOutputFile();
 
   /// }
@@ -835,20 +865,29 @@ public:
 
   bool lookupMissingImports(StringRef Name, SourceLocation TriggerLoc) override;
 
-  void setGenModuleActionWrapper(std::function<std::unique_ptr<FrontendAction>
-    (const FrontendOptions &Opts, std::unique_ptr<FrontendAction> Action)> Wrapper) {
+  void setGenModuleActionWrapper(GenModuleActionWrapperFunc Wrapper) {
     GenModuleActionWrapper = Wrapper;
-  };
+  }
 
-  std::function<std::unique_ptr<FrontendAction>
-    (const FrontendOptions &Opts, std::unique_ptr<FrontendAction> Action)>
-  getGenModuleActionWrapper() const { return GenModuleActionWrapper; }
+  GenModuleActionWrapperFunc getGenModuleActionWrapper() const {
+    return GenModuleActionWrapper;
+  }
 
   void addDependencyCollector(std::shared_ptr<DependencyCollector> Listener) {
     DependencyCollectors.push_back(std::move(Listener));
   }
 
   void setExternalSemaSource(IntrusiveRefCntPtr<ExternalSemaSource> ESS);
+
+  /// Adds a module to the \c InMemoryModuleCache at \p Path by retrieving the
+  /// pcm output from the \c ActionCache for \p CacheKey.
+  ///
+  /// \param Provider description of what provided this cache key, e.g.
+  /// "-fmodule-file-cache-key", or an imported pcm file. Used in diagnostics.
+  ///
+  /// \returns true on failure.
+  bool addCachedModuleFile(StringRef Path, StringRef CacheKey,
+                           StringRef Provider);
 
   InMemoryModuleCache &getModuleCache() const { return *ModuleCache; }
 };

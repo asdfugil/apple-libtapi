@@ -20,6 +20,7 @@
 #include "clang/Serialization/ASTBitCodes.h"
 #include "clang/Serialization/ContinuousRangeMap.h"
 #include "clang/Serialization/ModuleFileExtension.h"
+#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/SetVector.h"
@@ -56,6 +57,17 @@ enum ModuleKind {
 
   /// File is from a prebuilt module path.
   MK_PrebuiltModule
+};
+
+/// The input file info that has been loaded from an AST file.
+struct InputFileInfo {
+  std::string Filename;
+  uint64_t ContentHash;
+  off_t StoredSize;
+  time_t StoredTime;
+  bool Overridden;
+  bool Transient;
+  bool TopLevelModuleMap;
 };
 
 /// The input file that has been loaded from this AST file, along with
@@ -124,6 +136,17 @@ public:
   /// The file name of the module file.
   std::string FileName;
 
+  /// The \c ActionCache key for this module, or empty.
+  std::string ModuleCacheKey;
+
+  /// The CAS filesystem root ID for implicit modules built with the dependency
+  /// scanner, or empty.
+  std::string CASFileSystemRootID;
+
+  /// The include-tree root ID for implicit modules built with the dependency
+  /// scanner, or empty.
+  std::string IncludeTreeID;
+
   /// The name of the module.
   std::string ModuleName;
 
@@ -147,10 +170,6 @@ public:
   /// build this AST file.
   FileID OriginalSourceFileID;
 
-  /// The directory that the PCH was originally created in. Used to
-  /// allow resolving headers even after headers+PCH was moved to a new path.
-  std::string OriginalDir;
-
   std::string ModuleMapPath;
 
   /// Whether this precompiled header is a relocatable PCH file.
@@ -172,6 +191,9 @@ public:
   /// The signature of the AST block of the module file, this can be used to
   /// unique module files based on AST contents.
   ASTFileSignature ASTBlockHash;
+
+  /// The bit vector denoting usage of each header search entry (true = used).
+  llvm::BitVector SearchPathUsage;
 
   /// Whether this module has been directly imported by the
   /// user.
@@ -235,6 +257,9 @@ public:
   /// The input files that have been loaded from this AST file.
   std::vector<InputFile> InputFilesLoaded;
 
+  /// The input file infos that have been loaded from this AST file.
+  std::vector<InputFileInfo> InputFileInfosLoaded;
+
   // All user input files reside at the index range [0, NumUserInputFiles), and
   // system input files reside at [NumUserInputFiles, InputFilesLoaded.size()).
   unsigned NumUserInputFiles = 0;
@@ -260,7 +285,7 @@ public:
   int SLocEntryBaseID = 0;
 
   /// The base offset in the source manager's view of this module.
-  unsigned SLocEntryBaseOffset = 0;
+  SourceLocation::UIntTy SLocEntryBaseOffset = 0;
 
   /// Base file offset for the offsets in SLocEntryOffsets. Real file offset
   /// for the entry is SLocEntryOffsetsBase + SLocEntryOffsets[i].
@@ -274,7 +299,8 @@ public:
   SmallVector<uint64_t, 4> PreloadSLocEntries;
 
   /// Remapping table for source locations in this module.
-  ContinuousRangeMap<uint32_t, int, 2> SLocRemap;
+  ContinuousRangeMap<SourceLocation::UIntTy, SourceLocation::IntTy, 2>
+      SLocRemap;
 
   // === Identifiers ===
 
@@ -298,7 +324,7 @@ public:
   ///
   /// This pointer points into a memory buffer, where the on-disk hash
   /// table for identifiers actually lives.
-  const char *IdentifierTableData = nullptr;
+  const unsigned char *IdentifierTableData = nullptr;
 
   /// A pointer to an on-disk hash table of opaque type
   /// IdentifierHashTable.
