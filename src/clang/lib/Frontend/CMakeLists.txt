@@ -30,6 +30,7 @@ add_clang_library(clangFrontend
   HeaderIncludeGen.cpp
   IncludeTreePPActions.cpp
   InitPreprocessor.cpp
+  InitHeaderSearch.cpp
   LayoutOverrideSource.cpp
   LogDiagnosticPrinter.cpp
   ModuleDependencyCollector.cpp

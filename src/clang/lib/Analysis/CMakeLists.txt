@@ -18,15 +18,20 @@ add_clang_library(clangAnalysis
   CodeInjector.cpp
   Dominators.cpp
   ExprMutationAnalyzer.cpp
+  HTMLPathDiagnosticConsumer.cpp
   IssueHash.cpp
   LiveVariables.cpp
   MacroExpansionContext.cpp
   ObjCNoReturn.cpp
   PathDiagnostic.cpp
   PostOrderCFGView.cpp
+  PlistHTMLPathDiagnosticConsumer.cpp
   ProgramPoint.cpp
+  PlistPathDiagnosticConsumer.cpp
   ReachableCode.cpp
   RetainSummaryManager.cpp
+  SarifPathDiagnosticConsumer.cpp
+  TextPathDiagnosticConsumer.cpp
   ThreadSafety.cpp
   ThreadSafetyCommon.cpp
   ThreadSafetyLogical.cpp

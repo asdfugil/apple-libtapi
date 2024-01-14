@@ -23,6 +23,7 @@ add_clang_library(clangStaticAnalyzerCore
   CoreEngine.cpp
   DynamicExtent.cpp
   DynamicType.cpp
+  DynamicSize.cpp
   Environment.cpp
   ExplodedGraph.cpp
   ExprEngine.cpp

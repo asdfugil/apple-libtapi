@@ -19,6 +19,7 @@ add_clang_library(clangDriver
   Compilation.cpp
   Distro.cpp
   Driver.cpp
+  DarwinSDKInfo.cpp
   DriverOptions.cpp
   Job.cpp
   Multilib.cpp

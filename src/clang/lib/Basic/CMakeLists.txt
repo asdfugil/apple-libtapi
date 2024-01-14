@@ -64,6 +64,7 @@ add_clang_library(clangBasic
   NoSanitizeList.cpp
   SanitizerSpecialCaseList.cpp
   Sanitizers.cpp
+  SanitizerBlacklist.cpp
   Sarif.cpp
   SourceLocation.cpp
   SourceManager.cpp
